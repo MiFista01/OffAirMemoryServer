@@ -17,8 +17,8 @@ import { UniUrlDtoPipe } from '@pipes';
  *
  * @example
  * // Simple boolean query parameter
- * '@Get('clans')'
- * findClans(@QueryDto(QueryBooleanDto, 'isActive') isActive: boolean) {
+ * '@Get('channels')'
+ * findChannels(@QueryDto(QueryBooleanDto, 'isActive') isActive: boolean) {
  *   // isActive is validated and typed as boolean
  * }
  *
