@@ -12,9 +12,8 @@ import {
  *
  * @example
  * // In service:
- * this.businessValidationService.assertExists(bank, 'Bank not found');
- * this.businessValidationService.assertOwnership(trading, userId, 'You are not the owner');
- * this.businessValidationService.assertStatus(trading, 'active', 'Cannot update inactive trading');
+ * this.businessValidationService.assertExists(channel, 'Channel not found');
+ * this.businessValidationService.assertOwnership(profile, userId, 'You are not the owner');
  */
 @Injectable()
 export class BusinessValidationService {
@@ -98,7 +97,7 @@ export class BusinessValidationService {
    *
    * @example
    * // Simple equality (default)
-   * this.assertObjKey(trading, { key: 'userId', value: userId });
+   * this.assertObjKey(episode, { key: 'cartoonId', value: cartoonId });
    *
    * @example
    * // With operator
@@ -106,14 +105,14 @@ export class BusinessValidationService {
    *
    * @example
    * // With custom predicate
-   * this.assertObjKey(trading, {
-   *   key: 'status',
-   *   predicate: (val) => val === 'active' || val === 'pending'
+   * this.assertObjKey(channel, {
+   *   key: 'isActive',
+   *   predicate: (val) => val === true
    * });
    *
    * @example
    * // In array
-   * this.assertObjKey(trading, { key: 'status', value: ['active', 'pending'], operator: 'in' });
+   * this.assertObjKey(episode, { key: 'kind', value: ['episode', 'special'], operator: 'in' });
    */
   assertObjKey<T>(
     entity: T | T[],
@@ -325,7 +324,8 @@ export class BusinessValidationService {
    *
    * @example
    * // Object comparison by key
-   * this.assertContainsAll(userItems, requiredItems, 'Missing items', 'catalogItemId');
+   * this.assertContainsAll(playlistIds, requiredIds, 'Missing episodes');
+   * this.assertContainsAll(episodes, required, 'Missing episodes', 'id');
    */
   assertContainsAll<T>(
     array: T[],

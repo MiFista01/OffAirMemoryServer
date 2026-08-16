@@ -11,7 +11,7 @@ export class MediaScanController {
   @Public()
   @Get('status')
   @ApiOperation({
-    summary: 'Process + catalog scan status (no restart needed)',
+    summary: 'Process + media scan status (no restart needed)',
   })
   getStatus() {
     return this.mediaScan.getStatus();

@@ -43,10 +43,12 @@ async function bootstrap() {
     }),
   );
   const swaggerConfig = new DocumentBuilder()
-    .setTitle('API Starter')
-    .setDescription('Base NestJS API with auth and user/profile')
+    .setTitle('Off-Air Memory API')
+    .setDescription(
+      'Backend for Off-Air Memory: channels, cartoons, episodes, media scan, broadcast tags, and daily TV schedule',
+    )
     .setVersion('1.0')
-    .addTag('starter')
+    .addTag('off-air-memory')
     .build();
   const documentFactory = () =>
     SwaggerModule.createDocument(app, swaggerConfig);
