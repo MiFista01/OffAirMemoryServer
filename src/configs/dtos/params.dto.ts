@@ -7,6 +7,7 @@ import {
   IsPositive,
   IsString,
   IsUUID,
+  Matches,
 } from 'class-validator';
 import { Transform } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
@@ -74,6 +75,29 @@ export class ParamsStrDto {
   @IsString({ message: 'Value must be a string' })
   value: string;
 
+  constructor(data: any) {
+    this.value = data;
+  }
+}
+
+export class ParamsSlugDto {
+  @ApiProperty({
+    description: 'Slug value from URL params',
+    example: 'cartoon-network',
+    required: true,
+    type: String,
+  })
+  @Transform(({ value }) =>
+    typeof value === 'string'
+      ? value.trim().toLowerCase().replace(/\s+/g, '-')
+      : value,
+  )
+  @IsNotEmpty({ message: 'Value is required' })
+  @IsString({ message: 'Value must be a string' })
+  @Matches(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
+    message: 'Value must be a valid slug',
+  })
+  value: string;
   constructor(data: any) {
     this.value = data;
   }
