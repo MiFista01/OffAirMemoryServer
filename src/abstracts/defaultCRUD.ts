@@ -533,9 +533,9 @@ export abstract class DefaultCRUDService<
    * @template T - Entity type
    *
    * @example
-   * await userService.increment(1, 'balance', 100);
-   * await userService.increment({ email: 'john@example.com' }, 'balance', 100);
-   * await userService.increment({ email: 'john@example.com' }, 'balance', 100, manager);
+   * await cartoonService.increment(1, 'weight', 1);
+   * await cartoonService.increment({ slug: 'adventure-time' }, 'weight', 1);
+   * await cartoonService.increment({ slug: 'adventure-time' }, 'weight', 1, manager);
    */
   async increment(
     where: number | { [key: string]: any },
@@ -562,9 +562,9 @@ export abstract class DefaultCRUDService<
    * @template T - Entity type
    *
    * @example
-   * await userService.decrement(1, 'balance', 100);
-   * await userService.decrement({ email: 'john@example.com' }, 'balance', 100);
-   * await userService.decrement({ email: 'john@example.com' }, 'balance', 100, manager);
+   * await cartoonService.decrement(1, 'weight', 1);
+   * await cartoonService.decrement({ slug: 'adventure-time' }, 'weight', 1);
+   * await cartoonService.decrement({ slug: 'adventure-time' }, 'weight', 1, manager);
    */
   async decrement(
     where: number | { [key: string]: any },
