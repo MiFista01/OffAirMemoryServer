@@ -50,7 +50,13 @@ export class ScheduleDayService extends DefaultCRUDService<
 
     const cartoons = await this.cartoonService.findAllBySearch(
       { channelId, isActive: true },
-      ['episodes'],
+      [
+        'episodes',
+        'broadcastTags',
+        'broadcastTags.windows',
+        'episodes.broadcastTags',
+        'episodes.broadcastTags.windows',
+      ],
     );
     const scheduleDay = await this.create({ date, channelId });
     const { items, cursorTouched } = buildDayPlaylist(
