@@ -66,11 +66,7 @@ lite.db
 /public/
 /tasks.json
 
-# OSRM map extracts and processed routing graphs (large binaries)
-/osms/
-
-# starter-bd: commit only bootstrap/ + README (dev empty-DB seeds).
-# CatalogBackupService rotating dumps stay local under starter-bd/<group>/<timestamp>/.
-starter-bd/*
-!starter-bd/README.md
-!starter-bd/bootstrap/
+# Local DB dump seeds / rotating backups (keep out of git)
+db-seeds/*
+!db-seeds/README.md
+!db-seeds/bootstrap/

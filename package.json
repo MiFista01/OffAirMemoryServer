@@ -1,7 +1,7 @@
 {
-  "name": "server",
+  "name": "off-air-memory-server",
   "version": "0.0.1",
-  "description": "",
+  "description": "Off-Air Memory API — childhood cartoon archive, media scan, and TV-style daily schedule",
   "author": "",
   "private": true,
   "license": "UNLICENSED",

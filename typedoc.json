@@ -4,7 +4,7 @@
     ],
     "entryPointStrategy": "expand",
     "out": "docs/typedoc",
-    "name": "Crime Game API - Code Documentation",
+    "name": "Off-Air Memory API — Code Documentation",
     "includeVersion": true,
     "excludePrivate": false,
     "excludeProtected": false,
