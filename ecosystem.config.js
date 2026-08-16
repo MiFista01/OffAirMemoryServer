@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: "crime-server",
+    name: "off-air-memory-server",
     script: "dist/main.js",
     interpreter: "bun",
     instances: 1,
