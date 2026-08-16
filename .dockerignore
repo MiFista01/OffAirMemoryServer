@@ -1,0 +1,14 @@
+node_modules
+dist
+logs
+backups
+osms
+.git
+.qodo
+*.md
+coverage
+test
+*.log
+lite.db
+documentation
+docs

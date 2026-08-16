@@ -1,0 +1,150 @@
+{
+  // Common editor settings
+  "files.autoSave": "afterDelay",
+  "files.autoSaveWhenNoErrors": true,
+  "explorer.confirmDelete": false,
+  "explorer.confirmPasteNative": false,
+  "explorer.confirmDragAndDrop": false,
+  "security.workspace.trust.untrustedFiles": "open",
+  "security.restrictUNCAccess": false,
+  
+  // Workbench (themes, icons)
+  "workbench.iconTheme": "material-icon-theme",
+  "workbench.productIconTheme": "materialiconic-product-icons",
+  "workbench.colorTheme": "Tokyo Night",
+  "workbench.startupEditor": "readme",
+  "workbench.editor.navigationScope": "editor",
+  "workbench.editor.splitOnDragAndDrop": false,
+  "workbench.editorAssociations": {
+    "*.png": "gryc.viewer",
+    "*.gif": "imagePreview.previewEditor"
+  },
+  
+  // Editor settings
+  "editor.fontSize": 16,
+  "editor.wordWrap": "on",
+  "editor.minimap.enabled": true,
+  "editor.stickyScroll.enabled": true,
+  "editor.largeFileOptimizations": true,
+  "editor.linkedEditing": true,
+  "editor.accessibilitySupport": "off",
+  "editor.formatOnSaveMode": "modifications",
+  
+  // Editor - auto completion and suggestions
+  "editor.quickSuggestions": {
+    "other": true,
+    "comments": true,
+    "strings": true
+  },
+  "editor.inlineSuggest.enabled": false,
+  "editor.suggest.preview": true,
+  "editor.parameterHints.enabled": true,
+  "editor.hover.sticky": true,
+  "editor.hover.delay": 300,
+  "editor.hover.enabled": true,
+  "accessibility.verbosity.hover": true,
+  "accessibility.verbosity.inlineCompletions": false,
+  
+  // Editor - navigation
+  "editor.gotoLocation.multipleDefinitions": "goto",
+  "editor.gotoLocation.multipleTypeDefinitions": "goto",
+  "editor.gotoLocation.multipleReferences": "goto",
+  
+  // TypeScript settings
+  "[typescript]": {
+    "editor.defaultFormatter": "vscode.typescript-language-features"
+  },
+  "typescript.suggest.enabled": true,
+  "typescript.validate.enable": true,
+  "typescript.suggest.includeCompletionsForImportStatements": false,
+  "typescript.updateImportsOnFileMove.enabled": "always",
+  "js/ts.implicitProjectConfig.strictFunctionTypes": false,
+  "js/ts.implicitProjectConfig.experimentalDecorators": true,
+  "javascript.updateImportsOnFileMove.enabled": "always",
+  
+  // JSON settings
+  "[json]": {
+    "editor.defaultFormatter": "vscode.json-language-features"
+  },
+  
+  // Git settings
+  "git.enableSmartCommit": true,
+  "git.confirmSync": false,
+  "git.ignoreWindowsGit27Warning": true,
+  "git.promptToSaveFilesBeforeStash": "staged",
+  "git-graph.commitDetailsView.fileView.fileTree.compactFolders": false,
+  
+  // Diff Editor
+  "diffEditor.wordWrap": "on",
+  "diffEditor.ignoreTrimWhitespace": false,
+  
+  // File Nesting (for backend)
+  "explorer.fileNesting.enabled": true,
+  "explorer.fileNesting.patterns": {
+    "tsconfig.json": "tsconfig.*.json",
+    "package.json": "package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb, bun.lock, .npmrc, .yarnrc.yml",
+    "*.service.ts": "${capture}.service.spec.ts",
+    "*.controller.ts": "${capture}.controller.spec.ts",
+    "*.module.ts": "${capture}.module.spec.ts",
+    "*.entity.ts": "${capture}.entity.spec.ts",
+    "*.dto.ts": "${capture}.dto.spec.ts",
+    "*.spec.ts": "${capture}.ts",
+    "*.sqlite": "${capture}.${extname}-*",
+    "*.db": "${capture}.${extname}-*",
+    "*.sqlite3": "${capture}.${extname}-*",
+    "*.db3": "${capture}.${extname}-*",
+    "*.sdb": "${capture}.${extname}-*",
+    "*.s3db": "${capture}.${extname}-*",
+    "IDE.md": "extensions.list, command.ps1, settings.json, export-settings.ps1, keybindings.json"
+  },
+  
+  // Prettify TypeScript (for improved type display)
+  "prettify-ts.maxProperties": 10,
+  "prettify-ts.skippedTypeNames": [
+    "Array",
+    "ArrayBuffer",
+    "Buffer",
+    "Date",
+    "Error",
+    "Map",
+    "Number",
+    "RegExp",
+    "Set",
+    "String",
+    "Symbol",
+    "Repository",
+    "EntityManager",
+    "FindOptionsWhere",
+    "DeepPartial",
+    "ObjectLiteral",
+    "DataSource",
+    "QueryRunner",
+    "Transaction",
+    "Query"
+  ],
+  "prettify-ts.maxFunctionSignatures": 1,
+  "prettify-ts.maxUnionMembers": 10,
+  "prettify-ts.unwrapGenericArgumentsTypeNames": [
+    "Promise",
+    "Set",
+    "Map",
+    "Observable",
+    "Repository",
+    "EntityManager",
+    "DefaultCRUDService"
+  ],
+  "prettify-ts.maxCharacters": 2000,
+  "prettify-ts.maxDepth": 2,
+  
+  // Code Spell Checker
+  "cSpell.languageSettings": [],
+  
+  // Other settings
+  "npm.scriptHover": false,
+  "npm.fetchOnlinePackageInfo": false,
+  "http.proxyAuthorization": null,
+  "mcpServers": {},
+  "codium.codeCompletion.enable": true,
+  "movets.removeIndexSuffix": false,
+  "codesnap.showWindowTitle": true
+}

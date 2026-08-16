@@ -1,0 +1,72 @@
+{
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "declaration": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "target": "ES2021",
+    "sourceMap": true,
+    "outDir": "./dist",
+    "baseUrl": "./",
+    "paths": {
+      "@constants": [
+        "src/configs/const"
+      ],
+      "@app-types": [
+        "src/configs/types"
+      ],
+      "@func": [
+        "src/configs/func"
+      ],
+      "@utils": [
+        "src/utils"
+      ],
+      "@entities": [
+        "src/entities"
+      ],
+      "@entities-lite": [
+        "src/entities-lite"
+      ],
+      "@cron":[
+        "src/configs/cron"
+      ],
+      "@decorators": [
+        "src/decorators"
+      ],
+      "@validators": [
+        "src/validators"
+      ],
+      "@pipes": [
+        "src/pipes"
+      ],
+      "@interceptors": [
+        "src/interceptors"
+      ],
+      "@filters": [
+        "src/filters"
+      ],
+      "@dtos": [
+        "src/configs/dtos"
+      ],
+      "@guards": [
+        "src/guards"
+      ],
+      "@swagger": [
+        "src/configs/swagger"
+      ],
+    },
+    "incremental": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "strictNullChecks": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitAny": false,
+    "strictBindCallApply": true,
+    "noFallthroughCasesInSwitch": false
+  }
+}
