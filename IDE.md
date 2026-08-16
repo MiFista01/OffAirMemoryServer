@@ -1,6 +1,6 @@
-# IDE Extensions for NestJS
+# IDE Extensions for Off-Air Memory (NestJS)
 
-This document lists all functional extensions and settings for NestJS development. Copy the extension ID to search and install in VS Code/Cursor.
+Useful VS Code / Cursor extensions for this NestJS backend. Copy the extension ID to search and install.
 
 ## Task Management
 
