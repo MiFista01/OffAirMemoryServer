@@ -14,5 +14,10 @@ import { EpisodeModule } from '../episode/episode.module';
   ],
   controllers: [ChannelsController],
   providers: [ChannelsService],
+  exports: [
+    ChannelsService,
+    CartoonModule,
+    EpisodeModule
+  ],
 })
 export class ChannelsModule {}
