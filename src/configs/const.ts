@@ -20,6 +20,8 @@ export const keyWithoutLike = ['createdAt', 'updatedAt', 'slug'];
 
 export const tokenCookieName = 'authToken';
 
+export const airTimeHours = 15;
+
 export const winstonLoggerTuner: {
   filename: string;
   level: string;
