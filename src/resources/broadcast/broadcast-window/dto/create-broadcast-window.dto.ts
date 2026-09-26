@@ -1,5 +1,13 @@
+import { BroadcastWindowKind } from '@constants';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsIn, IsNotEmpty, IsNumber, IsOptional, IsString, Matches } from 'class-validator';
+import {
+  IsEnum,
+  IsNotEmpty,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Matches,
+} from 'class-validator';
 
 export class CreateBroadcastWindowDto {
   @ApiProperty({ example: 1 })
@@ -19,12 +27,12 @@ export class CreateBroadcastWindowDto {
   endMd: string;
 
   @ApiPropertyOptional({
-    example: 'boost',
-    enum: ['boost', 'only_during', 'exclude'],
+    example: BroadcastWindowKind.BOOST,
+    enum: BroadcastWindowKind,
   })
   @IsOptional()
-  @IsIn(['boost', 'only_during', 'exclude'])
-  kind?: 'boost' | 'only_during' | 'exclude';
+  @IsEnum(BroadcastWindowKind)
+  kind?: BroadcastWindowKind;
 
   @ApiPropertyOptional({ example: 3 })
   @IsOptional()
