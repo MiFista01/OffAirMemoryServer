@@ -22,6 +22,25 @@ export const tokenCookieName = 'authToken';
 
 export const airTimeHours = 15;
 
+export enum BroadcastWindowKind {
+  BOOST = 'boost',
+  ONLY_DURING = 'only_during',
+  EXCLUDE = 'exclude',
+}
+
+export const SKIP_DIRS = new Set([
+  '#recycle',
+  '$recycle.bin',
+  'system volume information',
+  '.ds_store',
+]);
+export const SEASON_DIR = /^s(\d+)$/i;
+export const SPECIALS_DIR = 'specials';
+export const EPISODE_FILE = /^(\d+)\.(mp4|mkv|webm|avi)$/i;
+export const VIDEO_EXT = new Set(['.mp4', '.mkv', '.webm', '.avi']);
+export const EPISODE_BATCH_SIZE = 200;
+export const DURATION_CONCURRENCY = 8;
+
 export const winstonLoggerTuner: {
   filename: string;
   level: string;
