@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -9,56 +9,8 @@ import { readdir } from 'fs/promises';
 import { extname, join, posix } from 'path';
 import { BusinessValidationService } from '@utils';
 import { getVideoDurationSec, mapLimit } from './video-duration';
-
-export type MediaScanStatus = {
-  processStartedAt: string;
-  uptimeSec: number;
-  lifecycle: string | null;
-  scanOnBoot: boolean;
-  isScanning: boolean;
-  lastScan: {
-    at: string;
-    durationMs: number;
-    created: ScanCounters;
-    existing: ScanCounters;
-    durations: { filled: number; failed: number };
-    error: string | null;
-  } | null;
-  counts: ScanCounters;
-};
-
-type ScanCounters = {
-  channels: number;
-  cartoons: number;
-  episodes: number;
-};
-
-type ScanIndex = {
-  channelBySlug: Map<string, Channel>;
-  cartoonByKey: Map<string, ChannelCartoon>;
-  episodeByPath: Set<string>;
-};
-
-type ScanContext = {
-  root: string;
-  index: ScanIndex;
-  created: ScanCounters;
-  existing: ScanCounters;
-};
-
-const SKIP_DIRS = new Set([
-  '#recycle',
-  '$recycle.bin',
-  'system volume information',
-  '.ds_store',
-]);
-
-const SEASON_DIR = /^s(\d+)$/i;
-const SPECIALS_DIR = 'specials';
-const EPISODE_FILE = /^(\d+)\.(mp4|mkv|webm|avi)$/i;
-const VIDEO_EXT = new Set(['.mp4', '.mkv', '.webm', '.avi']);
-const EPISODE_BATCH_SIZE = 200;
-const DURATION_CONCURRENCY = 8;
+import { DURATION_CONCURRENCY, EPISODE_BATCH_SIZE, EPISODE_FILE, SEASON_DIR, SKIP_DIRS, SPECIALS_DIR, VIDEO_EXT } from '@constants';
+import { MediaScanStatus, ScanContext, ScanIndex, ScanCounters } from '@app-types';
 
 @Injectable()
 export class MediaScanService implements OnModuleInit {
@@ -87,7 +39,7 @@ export class MediaScanService implements OnModuleInit {
 
   async onModuleInit() {
     if (this.scanOnBoot) {
-      void this.scan().catch(() => undefined);
+      void this.scan().catch(() => console.log('Error scanning media on boot'));
     }
   }
 
@@ -127,11 +79,10 @@ export class MediaScanService implements OnModuleInit {
 
     try {
       const root = this.config.getOrThrow<string>('MEDIA_ROOT');
-      if (!existsSync(root)) {
-        throw new ServiceUnavailableException(
-          `MEDIA_ROOT is not available: ${root}. Check that the drive is mounted.`,
-        );
-      }
+      this.businessValidation.assert(
+        existsSync(root),
+        `MEDIA_ROOT is not available: ${root}. Check that the drive is mounted.`,
+      );
       const ctx: ScanContext = {
         root,
         index: await this.loadIndex(),
@@ -203,8 +154,6 @@ export class MediaScanService implements OnModuleInit {
         slug,
         name: this.titleFromSlug(slug),
         isActive: false,
-        windowStart: '08:00',
-        windowEnd: '23:00',
       }),
     );
     ctx.index.channelBySlug.set(slug, channel);
