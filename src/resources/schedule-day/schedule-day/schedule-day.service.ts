@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { CreateScheduleDayDto } from './dto/create-schedule-day.dto';
 import { UpdateScheduleDayDto } from './dto/update-schedule-day.dto';
 import { DefaultCRUDService } from 'src/abstracts/defaultCRUD';
@@ -39,6 +39,13 @@ export class ScheduleDayService extends DefaultCRUDService<
     for (const channel of channels) {
       await this.createChannelDay(channel.id, date, airTimeSec);
     }
+  }
+
+  async onModuleInit() {
+    const date = todayUtcDate();
+    const airTimeSec = airTimeHours * 60 * 60;
+    if (await this.findOne({ date })) return;
+    await this.createDaySchedule();
   }
 
   private async createChannelDay(
