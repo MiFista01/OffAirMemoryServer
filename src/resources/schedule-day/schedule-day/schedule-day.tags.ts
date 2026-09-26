@@ -1,3 +1,4 @@
+import { BroadcastWindowKind } from '@constants';
 import { BroadcastWindow, ChannelCartoon, ChannelEpisode } from '@entities';
 
 export type DayTagEffects = {
@@ -66,15 +67,15 @@ function applyCartoonWindows(
 
   for (const tag of cartoon.broadcastTags ?? []) {
     for (const w of activeWindows(tag.windows, md)) {
-      if (w.kind === 'exclude') excluded.add(cartoon.id);
-      if (w.kind === 'boost') mul *= w.multiplier || 1;
-      if (w.kind === 'only_during') {
+      if (w.kind === BroadcastWindowKind.EXCLUDE) excluded.add(cartoon.id);
+      if (w.kind === BroadcastWindowKind.BOOST) mul *= w.multiplier || 1;
+      if (w.kind === BroadcastWindowKind.ONLY_DURING) {
         hasOnlyDuring = true;
         onlyActive = true;
       }
     }
     for (const w of tag.windows ?? []) {
-      if (w.kind === 'only_during') hasOnlyDuring = true;
+      if (w.kind === BroadcastWindowKind.ONLY_DURING) hasOnlyDuring = true;
     }
   }
 
@@ -96,7 +97,9 @@ function collectHolidaySpecial(
 
   const holiday = (ep.broadcastTags ?? []).some((tag) =>
     activeWindows(tag.windows, md).some(
-      (w) => w.kind === 'boost' || w.kind === 'only_during',
+      (w) =>
+        w.kind === BroadcastWindowKind.BOOST ||
+        w.kind === BroadcastWindowKind.ONLY_DURING,
     ),
   );
   if (!holiday) return;

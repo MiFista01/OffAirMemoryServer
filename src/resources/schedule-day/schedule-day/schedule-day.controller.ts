@@ -1,7 +1,5 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete } from '@nestjs/common';
+import { Controller, Get, Post} from '@nestjs/common';
 import { ScheduleDayService } from './schedule-day.service';
-import { CreateScheduleDayDto } from './dto/create-schedule-day.dto';
-import { UpdateScheduleDayDto } from './dto/update-schedule-day.dto';
 import { ParamDto, Public } from '@decorators';
 import { ParamsNumbDto, ParamsSlugDto } from '@dtos';
 import { todayUtcDate } from './schedule-day.builder';
@@ -21,7 +19,7 @@ export class ScheduleDayController {
   findAll(@ParamDto(ParamsNumbDto, 'channel-id') channelId: number) {
     return this.scheduleDayService.findAllBySearch(
       {date: todayUtcDate(), channelId},
-      ['scheduleItems.episode']
+      ['scheduleItems.episode'] 
     );
   }
 
