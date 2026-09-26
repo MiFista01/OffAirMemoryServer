@@ -8,6 +8,7 @@ export const startEnvCheck = [
   'JWT_KEY',
   'PROJECT_STATUS',
   'MEDIA_ROOT',
+  'STREAM_ROOT',
 ];
 
 // Sync cookiesDays with TOKEN_TIME in .env to avoid auth mismatches
@@ -20,7 +21,13 @@ export const keyWithoutLike = ['createdAt', 'updatedAt', 'slug'];
 
 export const tokenCookieName = 'authToken';
 
+/** Daily on-air window start (local wall clock in viewer tz). */
+export const AIR_WINDOW_START = '08:00';
 export const airTimeHours = 15;
+/** Public HLS path served by Nginx (must match deploy/nginx.conf). */
+export const STREAM_URL_PREFIX = '/stream';
+/** Stop ffmpeg if nobody called /start for this many seconds. */
+export const STREAM_IDLE_TTL_SEC = 300;
 
 export enum BroadcastWindowKind {
   BOOST = 'boost',

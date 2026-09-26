@@ -1,7 +1,8 @@
 import { Request } from 'express';
 import { UserProfile } from 'src/resources/user/profile/entities/profile.entity';
 import { UserAuth } from 'src/resources/user/auth/entities/auth.entity';
-import { Channel, ChannelCartoon } from '@entities';
+import { Channel, ChannelCartoon, ScheduleItem } from '@entities';
+import { ChildProcessWithoutNullStreams } from 'child_process';
 
 export type ReqWithUser = Request & {
   user: {
@@ -55,4 +56,23 @@ export type ScanContext = {
   index: ScanIndex;
   created: ScanCounters;
   existing: ScanCounters;
+};
+
+export type FfmpegJob = {
+  key: string;
+  process: ChildProcessWithoutNullStreams;
+  dir: string;
+  playlistUrl: string; // /stream/.../playlist.m3u8
+  lastAccessAt: number;
+};
+
+export enum StreamProfile {
+  P720 = '720p',
+  P480 = '480p',
+}
+
+export type PlaylistSegment = {
+  item: ScheduleItem;
+  inpointSec: number;
+  durationSec: number;
 };

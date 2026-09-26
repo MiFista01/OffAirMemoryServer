@@ -1,8 +1,10 @@
-import { ApiProperty } from '@nestjs/swagger';
+import { StreamProfile } from '@app-types';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
   IsArray,
   IsBoolean,
+  IsEnum,
   IsNumber,
   IsOptional,
   IsString,
@@ -90,6 +92,21 @@ export class QueryNumbDto {
   )
   @IsOptional()
   value: number;
+
+  constructor(data: any) {
+    this.value = data;
+  }
+}
+
+export class QueryStreamProfileDto {
+  @ApiPropertyOptional({
+    description: 'HLS quality profile',
+    enum: StreamProfile,
+    example: StreamProfile.P720,
+  })
+  @IsOptional()
+  @IsEnum(StreamProfile, { message: 'Value must be a valid StreamProfile' })
+  value: StreamProfile;
 
   constructor(data: any) {
     this.value = data;
