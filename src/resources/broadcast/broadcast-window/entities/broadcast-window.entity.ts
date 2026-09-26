@@ -1,3 +1,4 @@
+import { BroadcastWindowKind } from '@constants';
 import { BroadcastTag } from '../../broadcast-tag/entities/broadcast-tag.entity';
 import {
   Column,
@@ -6,8 +7,6 @@ import {
   ManyToOne,
   PrimaryGeneratedColumn,
 } from 'typeorm';
-
-export type BroadcastWindowKind = 'boost' | 'only_during' | 'exclude';
 
 @Entity()
 export class BroadcastWindow {
@@ -25,10 +24,14 @@ export class BroadcastWindow {
   @Column({ type: 'varchar', length: 5 })
   endMd: string;
 
-  @Column({ type: 'varchar', length: 16, default: 'boost' })
+  @Column({
+    type: 'enum',
+    enum: BroadcastWindowKind,
+    default: BroadcastWindowKind.BOOST,
+  })
   kind: BroadcastWindowKind;
 
-  /** Weight multiplier when kind=boost */
+  /** Weight multiplier when kind=BOOST */
   @Column({ type: 'float', default: 1 })
   multiplier: number;
 
