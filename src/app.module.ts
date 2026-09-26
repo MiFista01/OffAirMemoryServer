@@ -20,6 +20,7 @@ import { ChannelsModule } from './resources/channels/channels/channels.module';
 import { MediaScanModule } from './resources/channels/scan/media-scan.module';
 import { ScheduleDayModule } from './resources/schedule-day/schedule-day/schedule-day.module';
 import { BroadcastModule } from './resources/broadcast/broadcast.module';
+import { StreamModule } from './resources/stream/stream.module';
 
 @Module({
   imports: [
@@ -32,19 +33,19 @@ import { BroadcastModule } from './resources/broadcast/broadcast.module';
       useFactory: (
         configService: ConfigService,
       ): ServeStaticModuleOptions[] => [
-        {
-          rootPath: join(process.cwd(), 'public'),
-          serveRoot: '/static',
-        },
-        {
-          rootPath: configService.getOrThrow<string>('MEDIA_ROOT'),
-          serveRoot: '/media',
-          serveStaticOptions: {
-            index: false,
-            fallthrough: false,
+          {
+            rootPath: join(process.cwd(), 'public'),
+            serveRoot: '/static',
           },
-        },
-      ],
+          {
+            rootPath: configService.getOrThrow<string>('MEDIA_ROOT'),
+            serveRoot: '/media',
+            serveStaticOptions: {
+              index: false,
+              fallthrough: false,
+            },
+          },
+        ],
       inject: [ConfigService],
     }),
     ThrottlerModule.forRootAsync({
@@ -68,6 +69,7 @@ import { BroadcastModule } from './resources/broadcast/broadcast.module';
     MediaScanModule,
     ScheduleDayModule,
     BroadcastModule,
+    StreamModule,
   ],
   controllers: [AppController],
   providers: [
