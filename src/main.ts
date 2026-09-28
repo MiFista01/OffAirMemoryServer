@@ -1,5 +1,6 @@
 process.env.TZ = 'UTC';
 import { NestFactory, Reflector } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
 import { AppModule } from './app.module';
 import { ConfigService } from '@nestjs/config';
 import {
@@ -13,14 +14,17 @@ import { WINSTON_MODULE_NEST_PROVIDER } from 'nest-winston';
 import cookieParser from 'cookie-parser';
 import { DocumentBuilder } from '@nestjs/swagger';
 import { SwaggerModule } from '@nestjs/swagger';
-import { NextFunction, Request, Response } from 'express';
+import { NextFunction, Request, Response, static as expressStatic } from 'express';
 import compression from 'compression';
 import { BusinessValidationService } from '@utils';
 import { startEnvCheck } from '@constants';
 import session from 'express-session';
+import { FfmpegService } from './resources/stream/ffmpeg.service';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { rawBody: true });
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    rawBody: true,
+  });
   const config = app.get(ConfigService);
   const businessLogic: BusinessValidationService = app.get(
     BusinessValidationService,
@@ -30,12 +34,40 @@ async function bootstrap() {
     businessLogic.assertExists(config.get<string>(env), `${env} is required`);
   }
 
+  // HLS files when nginx is off
+  const nginxOn = config.get<string>('NGINX_ON', 'false') === 'true';
+  if (!nginxOn) {
+    const streamRoot = config.getOrThrow<string>('STREAM_ROOT').trim();
+    const ffmpeg = app.get(FfmpegService);
+    console.log(`[stream] static → ${streamRoot} at /stream`);
+    app.use(
+      '/stream',
+      (req: Request, res: Response, next: NextFunction) => {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+        res.setHeader('Accept-Ranges', 'bytes');
+        // Зритель тянет .m3u8/.ts → не гасим encode по idle TTL
+        const folder = req.path.split('/').filter(Boolean)[0];
+        if (folder) ffmpeg.touchByFolder(folder);
+        next();
+      },
+      expressStatic(streamRoot, {
+        fallthrough: true,
+        index: false,
+        etag: false,
+        lastModified: false,
+      }),
+    );
+  }
+
   app.use(
     compression({
       filter: (req, res) => {
         if (req.headers['x-no-compression']) {
           return false;
         }
+        if (req.url?.includes('/stream/')) return false;
         return compression.filter(req, res);
       },
       level: 6,
@@ -76,11 +108,15 @@ async function bootstrap() {
       crossOriginResourcePolicy: false,
     }),
   );
-  app.use(['/static', '/media'], (req: Request, res: Response, next: NextFunction) => {
+  app.use(['/static', '/media', '/stream'], (req: Request, res: Response, next: NextFunction) => {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Cross-Origin-Resource-Policy', 'cross-origin');
     res.header('Accept-Ranges', 'bytes');
-    res.header('Cache-Control', 'public, max-age=31536000, immutable');
+    if (req.path.startsWith('/stream') || req.url.includes('/stream')) {
+      res.header('Cache-Control', 'no-store, no-cache, must-revalidate');
+    } else {
+      res.header('Cache-Control', 'public, max-age=31536000, immutable');
+    }
     next();
   });
   app.enableCors({

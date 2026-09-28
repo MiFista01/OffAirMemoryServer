@@ -21,6 +21,7 @@ import { MediaScanModule } from './resources/channels/scan/media-scan.module';
 import { ScheduleDayModule } from './resources/schedule-day/schedule-day/schedule-day.module';
 import { BroadcastModule } from './resources/broadcast/broadcast.module';
 import { StreamModule } from './resources/stream/stream.module';
+import { AirHistoryModule } from './resources/air-history/air-history.module';
 
 @Module({
   imports: [
@@ -32,20 +33,24 @@ import { StreamModule } from './resources/stream/stream.module';
       imports: [ConfigModule],
       useFactory: (
         configService: ConfigService,
-      ): ServeStaticModuleOptions[] => [
+      ): ServeStaticModuleOptions[] => {
+        const roots: ServeStaticModuleOptions[] = [
           {
             rootPath: join(process.cwd(), 'public'),
             serveRoot: '/static',
           },
           {
-            rootPath: configService.getOrThrow<string>('MEDIA_ROOT'),
+            rootPath: configService.getOrThrow<string>('MEDIA_ROOT').trim(),
             serveRoot: '/media',
             serveStaticOptions: {
               index: false,
               fallthrough: false,
             },
           },
-        ],
+        ];
+        // /stream mounts in main.ts via express.static (more reliable for HLS)
+        return roots;
+      },
       inject: [ConfigService],
     }),
     ThrottlerModule.forRootAsync({
@@ -70,6 +75,7 @@ import { StreamModule } from './resources/stream/stream.module';
     ScheduleDayModule,
     BroadcastModule,
     StreamModule,
+    AirHistoryModule,
   ],
   controllers: [AppController],
   providers: [
