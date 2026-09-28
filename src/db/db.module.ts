@@ -8,20 +8,26 @@ import * as entitiesLite from '@entities-lite';
 
 dotenv.config();
 
-function getDbConf(dbName: string, isNamed: boolean = false) {
+function getDbConf(isNamed: boolean = false) {
   return {
     imports: [ConfigModule],
     inject: [ConfigService],
-    name: isNamed ? dbName : undefined,
+    name: isNamed ? 'secondary' : undefined,
     useFactory: async (configService: ConfigService) => {
+      const database =
+        configService.get<string>('DB_NAME') ||
+        process.env.DB_NAME ||
+        'off_air_memory';
       return {
         type: 'mariadb' as const,
         host: configService.get<string>('DB_HOST'),
-        port: configService.get<number>('DB_PORT'),
+        port: Number(configService.get<string | number>('DB_PORT', 3306)),
         username: configService.get<string>('DB_USER'),
-        password: configService.get<string>('DB_PASS'),
-        database: dbName,
+        password: configService.get<string>('DB_PASS') ?? '',
+        database,
         entities: [...Object.values(entities)],
+        // Creates/updates tables on boot. Does NOT create the database itself —
+        // run CREATE DATABASE off_air_memory; on MariaDB first.
         synchronize: true,
         timezone: 'Z',
         extra: {
@@ -44,9 +50,7 @@ function getDbConf(dbName: string, isNamed: boolean = false) {
  */
 @Module({
   imports: [
-    TypeOrmModule.forRootAsync(
-      getDbConf(process.env.DB_NAME || 'default-app'),
-    ),
+    TypeOrmModule.forRootAsync(getDbConf()),
     TypeOrmModule.forRoot({
       type: 'sqlite',
       database: 'lite.db',
