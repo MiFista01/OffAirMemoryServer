@@ -35,7 +35,7 @@ export class AirHistoryService extends DefaultCRUDService<
   }
 
   /**
-   * Записать доигранную серию (идемпотентно: channel+episode+date).
+   * Record a fully played episode (idempotent: channel+episode+date).
    */
   async recordFinished(input: RecordFinishedInput): Promise<AirHistory | null> {
     const ep = await this.episodes.findOne({ id: input.episodeId });
@@ -88,8 +88,8 @@ export class AirHistoryService extends DefaultCRUDService<
   }
 
   /**
-   * Перед сборкой дня: курсор мульта = последняя серия из истории,
-   * чтобы pickNextEpisode взял следующую. Теги/franchise не трогаем.
+   * Before building the day: cartoon cursor = last episode from history,
+   * so pickNextEpisode takes the next one. Do not touch tags/franchise.
    */
   applyHistoryToCursors(
     cartoons: ChannelCartoon[],
@@ -103,7 +103,7 @@ export class AirHistoryService extends DefaultCRUDService<
     }
   }
 
-  /** Последняя доигранная серия по каждому cartoonId канала. */
+  /** Last fully played episode per cartoonId on the channel. */
   async latestByCartoon(
     channelId: number,
   ): Promise<Map<number, AirHistory>> {

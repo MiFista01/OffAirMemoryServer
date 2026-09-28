@@ -14,8 +14,8 @@ export type AirHistoryOrigin = 'stream' | 'reconcile';
 export type AirHistorySource = 'regular' | 'special_insert' | 'holiday';
 
 /**
- * Факт доигранной серии — для сборки следующего дня (курсор / хронология).
- * Не управляет live-стримом.
+ * Record of a fully played episode — for building the next day (cursor / chronology).
+ * Does not drive the live stream.
  */
 @Entity()
 @Unique(['channelId', 'episodeId', 'date'])
@@ -33,7 +33,7 @@ export class AirHistory {
   @Column()
   episodeId: number;
 
-  /** Календарный день эфира YYYY-MM-DD (как ScheduleDay.date) */
+  /** Calendar air day YYYY-MM-DD (same as ScheduleDay.date) */
   @Column({ type: 'date' })
   date: string;
 
