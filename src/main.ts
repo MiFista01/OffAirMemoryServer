@@ -47,10 +47,10 @@ async function bootstrap() {
         res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.setHeader('Accept-Ranges', 'bytes');
-        // Зритель тянет .m3u8/.ts → не гасим encode по idle TTL
+        // Viewer is pulling .m3u8/.ts → do not kill encode on idle TTL
         const folder = req.path.split('/').filter(Boolean)[0];
         if (folder) ffmpeg.touchByFolder(folder);
-        // Пока seek — файла нет. 503 + Retry-After вместо лавины 404 / Global Exception.
+        // During seek the file is missing. 503 + Retry-After instead of a 404 storm / Global Exception.
         if (folder && ffmpeg.isFolderPreparing(folder)) {
           res.setHeader('Retry-After', '2');
           res.status(503).type('text/plain').send('HLS preparing');
