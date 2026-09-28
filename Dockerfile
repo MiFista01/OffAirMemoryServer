@@ -14,6 +14,11 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 
+# HLS encode — without ffmpeg the stream will not start
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile --production
 
