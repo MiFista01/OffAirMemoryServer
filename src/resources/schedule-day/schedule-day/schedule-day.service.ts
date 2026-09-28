@@ -79,8 +79,8 @@ export class ScheduleDayService
       ],
     );
 
-    // История эфира → курсоры: выпал Джек → следующая после последней в логе.
-    // Теги / holiday / franchise roulette — без изменений в buildDayPlaylist.
+    // Air history → cursors: Jack was aired → next after the last one in the log.
+    // Tags / holiday / franchise roulette — unchanged in buildDayPlaylist.
     const latest = await this.airHistory.latestByCartoon(channelId);
     this.airHistory.applyHistoryToCursors(cartoons, latest);
 
