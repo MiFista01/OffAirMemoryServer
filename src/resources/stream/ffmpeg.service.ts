@@ -50,6 +50,25 @@ export class FfmpegService implements OnModuleDestroy {
     return false;
   }
 
+  /**
+   * Encode уже крутится, но playlist ещё не готов (seek).
+   * Static middleware отвечает 503 вместо 404 — hls.js не устраивает шторм Not Found.
+   */
+  isFolderPreparing(folderName: string): boolean {
+    if (!folderName) return false;
+    for (const job of this.jobs.values()) {
+      if (!this.isAlive(job) || job.ready) continue;
+      if (
+        job.dir.replace(/\\/g, '/').endsWith(`/${folderName}`) ||
+        job.dir.endsWith(folderName) ||
+        job.playlistUrl.includes(`/${folderName}/`)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   async startHls(opts: {
     key: string;
     streamRoot: string;
@@ -162,13 +181,24 @@ export class FfmpegService implements OnModuleDestroy {
     let append = !!opts.append;
     if (append && !(await this.isPlaylistAppendable(dir))) {
       this.logger.warn(
-        `[${opts.key}] HLS broken/stale — fresh start instead of append`,
+        `[${opts.key}] HLS broken — fresh start instead of append`,
+      );
+      append = false;
+    }
+    // После idle/смены канала старый live-edge + новый mid-seek =
+    // «прыжок в будущее и откат». Append только пока сегменты горячие.
+    if (append && !(await this.isPlaylistFresh(dir))) {
+      this.logger.warn(
+        `[${opts.key}] HLS cold (idle/channel switch) — fresh start`,
       );
       append = false;
     }
 
-    // При !append не чистим .ts заранее: иначе стык серий = пустая папка и пауза в эфире.
-    // Мусор после перезаписи m3u8 подберёт sweepOrphanSegments.
+    // Fresh: убираем старый m3u8/.ts, иначе плеер на секунду ест прошлый live-edge.
+    // Append (стык серий в том же эфире) — не трогаем, иначе дыра до первого .ts.
+    if (!append) {
+      await this.clearHlsFolder(dir);
+    }
 
     const startNumber = append ? await this.nextStartNumber(dir) : 0;
 
@@ -270,22 +300,26 @@ export class FfmpegService implements OnModuleDestroy {
       this.handoffTimers.set(opts.key, timer);
     }
 
-    // /start не ждёт минуту: коротко пробуем, иначе starting + фон.
+    // Append/стык — коротко. Cold (смена канала / после idle) — ждём первый .ts,
+    // иначе клиент сразу ломится в пустой playlist → лавина 404 и «off air».
     const quickMs = Number(this.config.get('STREAM_START_QUICK_MS', 4000));
+    const coldMs = Number(this.config.get('STREAM_START_COLD_MS', 12000));
+    const initialWait = append
+      ? Math.max(1500, Number.isFinite(quickMs) ? quickMs : 4000)
+      : Math.max(
+          8000,
+          Number.isFinite(coldMs) ? coldMs : 12_000,
+          Number.isFinite(quickMs) ? quickMs : 4000,
+        );
     try {
-      await this.waitForPlaylist(
-        playlist,
-        child,
-        Math.max(1500, quickMs),
-        startNumber,
-      );
+      await this.waitForPlaylist(playlist, child, initialWait, startNumber);
       job.ready = true;
       void this.sweepOrphanSegments(dir).catch((e) =>
         this.logger.warn(`[${opts.key}] orphan sweep failed: ${e}`),
       );
       return job;
     } catch {
-      /* deferred */
+      /* deferred — клиент должен поллить /status, не играть URL */
     }
 
     const seekSec = Math.max(0, firstSeg?.inpointSec ?? 0);
@@ -393,9 +427,13 @@ export class FfmpegService implements OnModuleDestroy {
       }
       if (job.lastAccessAt >= cutoff) continue;
       this.logger.log(
-        `[${key}] idle ${ttl}s (no viewers) — stopping ffmpeg`,
+        `[${key}] idle ${ttl}s (no viewers) — stopping ffmpeg + clear HLS`,
       );
+      const dir = job.dir;
       this.stop(key);
+      // Не оставляем мёртвый playlist: при возврате на канал append к нему
+      // даёт прыжок wall-clock «в будущее». air-finish.json не трогаем.
+      void this.clearHlsFolder(dir).catch(() => undefined);
     }
   }
 
@@ -589,6 +627,28 @@ export class FfmpegService implements OnModuleDestroy {
       /* no playlist */
     }
     return max + 1;
+  }
+
+  /**
+   * Append имеет смысл только пока HLS «живой» (стык серий / мгновенный restart).
+   * После idle/смены канала сегменты остывают → fresh.
+   */
+  async isPlaylistFresh(dir: string, maxAgeSec?: number): Promise<boolean> {
+    const hlsTime = Number(this.config.get('HLS_TIME', 2));
+    const listSize = Number(this.config.get('HLS_LIST_SIZE', 12));
+    const defaultMax = Math.max(
+      20,
+      (Number.isFinite(hlsTime) ? hlsTime : 2) *
+        Math.min(6, Number.isFinite(listSize) ? listSize : 12) +
+        8,
+    );
+    const maxSec =
+      maxAgeSec != null && Number.isFinite(maxAgeSec) && maxAgeSec > 0
+        ? maxAgeSec
+        : defaultMax;
+    const ageMs = await this.newestSegmentAgeMs(dir);
+    if (ageMs == null) return false;
+    return ageMs <= maxSec * 1000;
   }
 
   /** Append только если все .ts из m3u8 реально на диске. */

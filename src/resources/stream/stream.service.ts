@@ -61,7 +61,6 @@ export class StreamService implements OnModuleDestroy {
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
     const folderName = streamFolderName(slug, tz, profile);
     const dir = join(streamRoot, folderName);
-    const playlist = join(dir, 'playlist.m3u8');
 
     // 1) Живой encode — переподключаемся, НО не отдаём зависший на концовке.
     const existing = this.ffmpeg.get(key);
@@ -80,13 +79,8 @@ export class StreamService implements OnModuleDestroy {
             `${nearEnd ? ', near end → skip' : ', mid → restart'})`,
         );
         this.ffmpeg.stop(key);
-        let append = false;
-        try {
-          await access(playlist);
-          append = true;
-        } catch {
-          append = false;
-        }
+        // Append только если HLS ещё горячий; иначе fresh (без прыжка wall-clock).
+        const append = await this.ffmpeg.isPlaylistFresh(dir);
         if (nearEnd) {
           return this.runEncode(slug, tz, profile, append, 'wall-clock', {
             skipCurrent: true,
@@ -103,14 +97,7 @@ export class StreamService implements OnModuleDestroy {
       return this.jobResponse(slug, existing);
     }
 
-    const airWindowStart = this.config.get<string>(
-      'AIR_WINDOW_START',
-      AIR_WINDOW_START,
-    );
-    const hours = this.airTimeHours();
     const date = calendarDateInTz(tz);
-    const airStart = windowStartAt(date, airWindowStart, tz);
-    const inWindow = isWithinAirWindow(airStart, hours);
 
     // 2) После рестарта Nest: продолжить тот же мульт, что кодировали
     // (не откатываться на wall-clock — skip/stall мог уйти вперёд сетки).
@@ -149,13 +136,9 @@ export class StreamService implements OnModuleDestroy {
       }
     }
 
-    let append = false;
-    try {
-      await access(playlist);
-      append = true;
-    } catch {
-      append = false;
-    }
+    // Холодный старт / возврат на канал: append только к горячему HLS.
+    // Иначе старый live-edge + mid-seek = «в будущее и обратно».
+    const append = await this.ffmpeg.isPlaylistFresh(dir);
     return this.runEncode(slug, tz, profile, append, 'wall-clock');
   }
 
@@ -830,7 +813,7 @@ export class StreamService implements OnModuleDestroy {
 
     return {
       channel: slug,
-      streamUrl: job.playlistUrl,
+      streamUrl: job.ready ? job.playlistUrl : null,
       episodeId: firstEp.id,
       offsetSec: first.inpointSec,
       source: first.item.source,
@@ -838,19 +821,35 @@ export class StreamService implements OnModuleDestroy {
       encodeWindowSec: segments.reduce((s, x) => s + x.durationSec, 0),
       airWindowStart,
       ready: !!job.ready,
+      playable: !!job.ready,
       status: job.ready ? ('live' as const) : ('starting' as const),
+      pollAfterMs: job.ready ? undefined : 2000,
       message: job.ready
         ? undefined
         : 'Эфир есть, подготавливаем поток — подождите несколько секунд',
     };
   }
 
-  /** Готов ли HLS к плееру (для поллинга с фронта). */
-  async status(slug: string, tz = 'Europe/Tallinn', profile = '720p') {
+  /**
+   * Готов ли HLS. Лёгкий поллинг (~2с).
+   * ensure=true — если эфир есть, а encode ещё нет (типично после рестарта Nest /
+   * смены канала), поднять через /start и вернуть starting|live.
+   * status: live | starting | idle | off
+   */
+  async status(
+    slug: string,
+    tz = 'Europe/Tallinn',
+    profile = '720p',
+    ensure = false,
+  ) {
     const key = `${slug}:${tz}:${profile}`;
     const job = this.ffmpeg.get(key);
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
-    const dir = join(streamRoot, streamFolderName(slug, tz, profile));
+    const folderName = streamFolderName(slug, tz, profile);
+    const dir = join(streamRoot, folderName);
+    const streamUrl =
+      job?.playlistUrl ?? `${STREAM_URL_PREFIX}/${folderName}/playlist.m3u8`;
+
     let hasPlaylist = false;
     try {
       await access(join(dir, 'playlist.m3u8'));
@@ -860,33 +859,137 @@ export class StreamService implements OnModuleDestroy {
     }
     const ageMs = hasPlaylist ? await this.ffmpeg.segmentAgeMs(dir) : null;
     const alive = !!(job && this.ffmpeg.isJobAlive(job));
-    const ready =
+    let ready =
       !!job?.ready ||
       (alive && ageMs != null && ageMs < 30_000) ||
       (!!hasPlaylist && ageMs != null && ageMs < 15_000);
 
     if (job && ready && !job.ready) job.ready = true;
 
+    if (ready) {
+      return {
+        channel: slug,
+        key,
+        alive,
+        ready: true,
+        playable: true,
+        status: 'live' as const,
+        streamUrl,
+        ageSec: ageMs != null ? Math.round(ageMs / 1000) : null,
+        pollAfterMs: undefined as number | undefined,
+        message: undefined as string | undefined,
+      };
+    }
+
+    if (alive) {
+      return {
+        channel: slug,
+        key,
+        alive: true,
+        ready: false,
+        playable: false,
+        status: 'starting' as const,
+        // URL ещё нельзя кормить в hls.js — будет лавина 404.
+        streamUrl: null as string | null,
+        ageSec: ageMs != null ? Math.round(ageMs / 1000) : null,
+        pollAfterMs: 2000,
+        message: 'Эфир есть, подготавливаем поток — подождите',
+      };
+    }
+
+    // Нет job: либо ещё не стартовали (после рестарта / смены канала), либо off air.
+    const onAir = await this.isChannelOnAir(slug, tz, profile);
+    if (!onAir) {
+      return {
+        channel: slug,
+        key,
+        alive: false,
+        ready: false,
+        playable: false,
+        status: 'off' as const,
+        streamUrl: null as string | null,
+        ageSec: null as number | null,
+        pollAfterMs: undefined as number | undefined,
+        message: 'Сейчас не в эфире',
+      };
+    }
+
+    if (ensure) {
+      try {
+        const started = await this.start(slug, tz, profile);
+        const startedReady = !!started.ready;
+        return {
+          channel: slug,
+          key,
+          alive: true,
+          ready: startedReady,
+          playable: startedReady,
+          status: startedReady ? ('live' as const) : ('starting' as const),
+          streamUrl: startedReady ? started.streamUrl : null,
+          ageSec: null as number | null,
+          pollAfterMs: startedReady ? undefined : 2000,
+          message: started.message,
+        };
+      } catch (e) {
+        this.logger.warn(`[${key}] status ensure start failed: ${e}`);
+        return {
+          channel: slug,
+          key,
+          alive: false,
+          ready: false,
+          playable: false,
+          status: 'off' as const,
+          streamUrl: null as string | null,
+          ageSec: null as number | null,
+          pollAfterMs: undefined as number | undefined,
+          message: 'Сейчас не в эфире',
+        };
+      }
+    }
+
     return {
       channel: slug,
       key,
-      alive,
-      ready,
-      status: !alive && !ready
-        ? ('off' as const)
-        : ready
-          ? ('live' as const)
-          : ('starting' as const),
-      streamUrl:
-        job?.playlistUrl ??
-        `${STREAM_URL_PREFIX}/${streamFolderName(slug, tz, profile)}/playlist.m3u8`,
-      ageSec: ageMs != null ? Math.round(ageMs / 1000) : null,
-      message: ready
-        ? undefined
-        : alive
-          ? 'Эфир есть, подготавливаем поток — подождите'
-          : 'Эфир не запущен',
+      alive: false,
+      ready: false,
+      playable: false,
+      status: 'idle' as const,
+      streamUrl: null as string | null,
+      ageSec: null as number | null,
+      pollAfterMs: 2000,
+      message:
+        'Эфир есть, поток ещё не запущен — подождите или вызовите /start',
     };
+  }
+
+  /** В окне эфира / overrun / air-finish — можно поднимать encode. */
+  private async isChannelOnAir(
+    slug: string,
+    tz: string,
+    profile: string,
+  ): Promise<boolean> {
+    const channel = await this.channels.findOne({ slug, isActive: true });
+    if (!channel?.isActive) return false;
+
+    const airWindowStart = this.config.get<string>(
+      'AIR_WINDOW_START',
+      AIR_WINDOW_START,
+    );
+    const hours = this.airTimeHours();
+    const date = calendarDateInTz(tz);
+    const airStart = windowStartAt(date, airWindowStart, tz);
+    if (isWithinAirWindow(airStart, hours)) return true;
+
+    const day = await this.loadScheduleDay(channel.id, tz);
+    if (day && isFinishingOverrun(day.scheduleItems, airStart, hours)) {
+      return true;
+    }
+
+    const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
+    const finish = await readAirFinish(
+      join(streamRoot, streamFolderName(slug, tz, profile)),
+    );
+    return !!finish;
   }
 
   private jobResponse(
@@ -903,7 +1006,7 @@ export class StreamService implements OnModuleDestroy {
     const ready = !!job.ready;
     return {
       channel: slug,
-      streamUrl: job.playlistUrl,
+      streamUrl: ready ? job.playlistUrl : null,
       episodeId: job.episodeId ?? 0,
       offsetSec: job.offsetSec ?? 0,
       source: job.source ?? 'regular',
@@ -914,7 +1017,9 @@ export class StreamService implements OnModuleDestroy {
         AIR_WINDOW_START,
       ),
       ready,
+      playable: ready,
       status: ready ? ('live' as const) : ('starting' as const),
+      pollAfterMs: ready ? undefined : 2000,
       message: ready
         ? undefined
         : 'Эфир есть, подготавливаем поток — подождите несколько секунд',

@@ -50,6 +50,12 @@ async function bootstrap() {
         // Зритель тянет .m3u8/.ts → не гасим encode по idle TTL
         const folder = req.path.split('/').filter(Boolean)[0];
         if (folder) ffmpeg.touchByFolder(folder);
+        // Пока seek — файла нет. 503 + Retry-After вместо лавины 404 / Global Exception.
+        if (folder && ffmpeg.isFolderPreparing(folder)) {
+          res.setHeader('Retry-After', '2');
+          res.status(503).type('text/plain').send('HLS preparing');
+          return;
+        }
         next();
       },
       expressStatic(streamRoot, {
@@ -58,6 +64,11 @@ async function bootstrap() {
         etag: false,
         lastModified: false,
       }),
+      (_req: Request, res: Response) => {
+        if (!res.headersSent) {
+          res.status(404).type('text/plain').send('HLS not ready');
+        }
+      },
     );
   }
 

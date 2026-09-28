@@ -3,7 +3,7 @@ import { StreamService } from './stream.service';
 import { FfmpegService } from './ffmpeg.service';
 import { ParamDto, Public, QueryDto } from '@decorators';
 import { ApiOperation } from '@nestjs/swagger';
-import { ParamsSlugDto, QueryStrDto, QueryStreamProfileDto } from '@dtos';
+import { ParamsSlugDto, QueryBooleanDto, QueryStrDto, QueryStreamProfileDto } from '@dtos';
 import { StreamProfile } from '@app-types';
 import { Request } from 'express';
 
@@ -44,15 +44,22 @@ export class StreamController {
   @Public()
   @Get(':slug/status')
   @ApiOperation({
-    summary: 'HLS ready? Poll while start returns status=starting',
+    summary:
+      'HLS ready? Poll while starting. ?ensure=1 — поднять encode если эфир есть, но ещё не запущен',
   })
   async status(
     @Req() req: Request,
     @ParamDto(ParamsSlugDto, 'slug') slug: string,
     @QueryDto(QueryStrDto, 'tz') tz?: string,
     @QueryDto(QueryStreamProfileDto, 'profile') profile?: StreamProfile,
+    @QueryDto(QueryBooleanDto, 'ensure') ensure?: boolean,
   ) {
-    const result = await this.streamService.status(slug, tz, profile);
+    const result = await this.streamService.status(
+      slug,
+      tz,
+      profile,
+      !!ensure,
+    );
     return {
       ...result,
       streamUrl: this.absoluteStreamUrl(req, result.streamUrl),
@@ -83,7 +90,11 @@ export class StreamController {
     return this.streamService.stop(slug, tz, profile);
   }
 
-  private absoluteStreamUrl(req: Request, path: string): string {
+  private absoluteStreamUrl(
+    req: Request,
+    path: string | null | undefined,
+  ): string | null {
+    if (!path) return null;
     if (/^https?:\/\//i.test(path)) return path;
     const host = req.get('x-forwarded-host') || req.get('host');
     const proto =
