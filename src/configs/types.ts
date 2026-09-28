@@ -65,7 +65,7 @@ export type FfmpegJob = {
   playlistUrl: string; // /stream/.../playlist.m3u8
   lastAccessAt: number;
   startedAt?: number;
-  /** Первый .ts уже есть — можно отдавать в плеер. */
+  /** First .ts already exists — safe to hand to the player. */
   ready?: boolean;
   onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
   episodeId?: number;
