@@ -54,6 +54,82 @@ export function windowStartAt(
   return new Date(asUtc - tzOffsetMs(tz, once));
 }
 
+/** Конец эфирного окна: start + N часов. */
+export function windowEndAt(airStart: Date, airTimeHours: number): Date {
+  return new Date(airStart.getTime() + airTimeHours * 60 * 60 * 1000);
+}
+
+export function isWithinAirWindow(
+  airStart: Date,
+  airTimeHours: number,
+  now = new Date(),
+): boolean {
+  const t = now.getTime();
+  return t >= airStart.getTime() && t < windowEndAt(airStart, airTimeHours).getTime();
+}
+
+/**
+ * Эпизоды, чей старт < конца окна. Текущий может зайти за лимит и доиграться;
+ * следующие после cutoff в concat не попадают.
+ */
+export function trimPlaylistToAirEnd(
+  remaining: PlaylistSegment[],
+  airTimeHours: number,
+  airStart: Date,
+  now = new Date(),
+): PlaylistSegment[] {
+  if (!remaining.length) return remaining;
+  const windowEnd = windowEndAt(airStart, airTimeHours).getTime();
+  // абсолютное начало текущего слота
+  let absStart = now.getTime() - remaining[0].inpointSec * 1000;
+  const out: PlaylistSegment[] = [];
+  for (const seg of remaining) {
+    if (absStart >= windowEnd) break;
+    out.push(seg);
+    absStart += seg.item.durationSec * 1000;
+  }
+  return out;
+}
+
+/** После лимита: доигрываем только слот, который начался до конца окна. */
+export function isFinishingOverrun(
+  items: ScheduleItem[],
+  airStart: Date,
+  airTimeHours: number,
+  now = new Date(),
+): boolean {
+  if (isWithinAirWindow(airStart, airTimeHours, now)) return false;
+  if (now.getTime() < airStart.getTime()) return false;
+
+  const windowEnd = windowEndAt(airStart, airTimeHours).getTime();
+  const nowMs = now.getTime();
+  const sorted = [...items].sort((a, b) => a.order - b.order);
+  let cursor = airStart.getTime();
+  for (const item of sorted) {
+    const end = cursor + item.durationSec * 1000;
+    if (nowMs >= cursor && nowMs < end) {
+      return cursor < windowEnd;
+    }
+    cursor = end;
+  }
+  return false;
+}
+
+/** key = `slug:Europe/Tallinn:720p` */
+export function parseStreamKey(key: string): {
+  slug: string;
+  tz: string;
+  profile: string;
+} {
+  const i = key.indexOf(':');
+  const j = key.lastIndexOf(':');
+  return {
+    slug: key.slice(0, i),
+    tz: key.slice(i + 1, j),
+    profile: key.slice(j + 1),
+  };
+}
+
 export function findCurrentSlot(
   items: ScheduleItem[],
   airStart: Date,
