@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, Inject, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -11,9 +11,11 @@ import { BusinessValidationService } from '@utils';
 import { getVideoDurationSec, mapLimit } from './video-duration';
 import { DURATION_CONCURRENCY, EPISODE_BATCH_SIZE, EPISODE_FILE, SEASON_DIR, SKIP_DIRS, SPECIALS_DIR, VIDEO_EXT } from '@constants';
 import { MediaScanStatus, ScanContext, ScanIndex, ScanCounters } from '@app-types';
+import { ScheduleDayService } from 'src/resources/schedule-day/schedule-day/schedule-day.service';
 
 @Injectable()
 export class MediaScanService implements OnModuleInit {
+  private readonly logger = new Logger(MediaScanService.name);
   private readonly processStartedAt = new Date();
   private scanning = false;
   private lastScan: MediaScanStatus['lastScan'] = null;
@@ -27,6 +29,8 @@ export class MediaScanService implements OnModuleInit {
     @InjectRepository(ChannelEpisode)
     private readonly episodeRep: Repository<ChannelEpisode>,
     private readonly businessValidation: BusinessValidationService,
+    @Inject(forwardRef(() => ScheduleDayService))
+    private readonly scheduleDays: ScheduleDayService,
   ) {}
 
   get scanOnBoot(): boolean {
@@ -98,6 +102,12 @@ export class MediaScanService implements OnModuleInit {
         durations,
         null,
       );
+      // Boot schedule runs before scan; rebuild today after catalog is filled.
+      try {
+        await this.scheduleDays.createDaySchedule();
+      } catch (e) {
+        this.logger.warn(`post-scan schedule rebuild failed: ${e}`);
+      }
       return this.getStatus();
     } catch (error) {
       this.lastScan = this.buildLastScan(
