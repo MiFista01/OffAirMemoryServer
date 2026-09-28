@@ -45,7 +45,7 @@ export class StreamController {
   @Get(':slug/status')
   @ApiOperation({
     summary:
-      'HLS ready? Poll while starting. ?ensure=1 — поднять encode если эфир есть, но ещё не запущен',
+      'HLS ready? Poll while starting. ?ensure=1 — start encode if on air but not running yet',
   })
   async status(
     @Req() req: Request,

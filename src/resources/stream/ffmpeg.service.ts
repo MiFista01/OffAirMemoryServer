@@ -51,8 +51,8 @@ export class FfmpegService implements OnModuleDestroy {
   }
 
   /**
-   * Encode уже крутится, но playlist ещё не готов (seek).
-   * Static middleware отвечает 503 вместо 404 — hls.js не устраивает шторм Not Found.
+   * Encode is already running, but the playlist is not ready yet (seek).
+   * Static middleware answers 503 instead of 404 — so hls.js does not get a Not Found storm.
    */
   isFolderPreparing(folderName: string): boolean {
     if (!folderName) return false;
@@ -75,9 +75,9 @@ export class FfmpegService implements OnModuleDestroy {
     folderName: string;
     segments: { path: string; inpointSec: number; durationSec: number }[];
     append?: boolean;
-    /** false when lookahead=0 (один длинный encode — handoff только вредит). */
+    /** false when lookahead=0 (one long encode — handoff only hurts). */
     rollingHandoff?: boolean;
-    /** Уже был retry без append — не зацикливать. */
+    /** Already retried without append — do not loop. */
     _freshRetry?: boolean;
     onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
     onStallEnd?: () => void | Promise<void>;
@@ -121,19 +121,19 @@ export class FfmpegService implements OnModuleDestroy {
     return job.process.exitCode === null && !job.process.killed;
   }
 
-  /** Публичная проверка для StreamService (reconnect после лимита). */
+  /** Public check for StreamService (reconnect after the air window limit). */
   isJobAlive(job: FfmpegJob): boolean {
     return this.isAlive(job);
   }
 
-  /** Возраст новейшего .ts (мс) — для /start на зависшем encode. */
+  /** Age of newest .ts (ms) — for /start on a stalled encode. */
   async segmentAgeMs(dir: string): Promise<number | null> {
     return this.newestSegmentAgeMs(dir);
   }
 
   /**
-   * Убить encode с пометкой stall (чтобы exit вызвал onStallEnd),
-   * либо тихо если уже мёртв.
+   * Kill encode marked as stall (so exit triggers onStallEnd),
+   * or quietly if already dead.
    */
   requestStallSkip(key: string): boolean {
     const job = this.jobs.get(key);
@@ -185,8 +185,8 @@ export class FfmpegService implements OnModuleDestroy {
       );
       append = false;
     }
-    // После idle/смены канала старый live-edge + новый mid-seek =
-    // «прыжок в будущее и откат». Append только пока сегменты горячие.
+    // After idle/channel switch, stale live-edge + new mid-seek =
+    // a jump into the future then rollback. Append only while segments are hot.
     if (append && !(await this.isPlaylistFresh(dir))) {
       this.logger.warn(
         `[${opts.key}] HLS cold (idle/channel switch) — fresh start`,
@@ -194,8 +194,8 @@ export class FfmpegService implements OnModuleDestroy {
       append = false;
     }
 
-    // Fresh: убираем старый m3u8/.ts, иначе плеер на секунду ест прошлый live-edge.
-    // Append (стык серий в том же эфире) — не трогаем, иначе дыра до первого .ts.
+    // Fresh: remove old m3u8/.ts, otherwise the player briefly eats the previous live-edge.
+    // Append (episode seam in the same air window) — leave alone, or a gap until the first .ts.
     if (!append) {
       await this.clearHlsFolder(dir);
     }
@@ -203,7 +203,7 @@ export class FfmpegService implements OnModuleDestroy {
     const startNumber = append ? await this.nextStartNumber(dir) : 0;
 
     const firstSeg = opts.segments[0];
-    // Один файл + mid-seek → -ss до -i (на X:/NAS в разы быстрее concat inpoint).
+    // Single file + mid-seek → -ss before -i (much faster than concat inpoint on X:/NAS).
     const useFastSeek =
       opts.segments.length === 1 && (firstSeg?.inpointSec ?? 0) > 2;
 
@@ -300,8 +300,8 @@ export class FfmpegService implements OnModuleDestroy {
       this.handoffTimers.set(opts.key, timer);
     }
 
-    // Append/стык — коротко. Cold (смена канала / после idle) — ждём первый .ts,
-    // иначе клиент сразу ломится в пустой playlist → лавина 404 и «off air».
+    // Append/seam — short wait. Cold (channel switch / after idle) — wait for the first .ts,
+    // otherwise the client hits an empty playlist → 404 storm and false "off air".
     const quickMs = Number(this.config.get('STREAM_START_QUICK_MS', 4000));
     const coldMs = Number(this.config.get('STREAM_START_COLD_MS', 12000));
     const initialWait = append
@@ -319,7 +319,7 @@ export class FfmpegService implements OnModuleDestroy {
       );
       return job;
     } catch {
-      /* deferred — клиент должен поллить /status, не играть URL */
+      /* deferred — client must poll /status, not play the URL yet */
     }
 
     const seekSec = Math.max(0, firstSeg?.inpointSec ?? 0);
@@ -383,7 +383,7 @@ export class FfmpegService implements OnModuleDestroy {
     return [...this.jobs.values()];
   }
 
-  /** Полная очистка HLS после конца эфира: .ts + .m3u8 + concat. */
+  /** Full HLS wipe after end of air: .ts + .m3u8 + concat. */
   async clearHlsFolder(dir: string): Promise<void> {
     let names: string[] = [];
     try {
@@ -431,13 +431,13 @@ export class FfmpegService implements OnModuleDestroy {
       );
       const dir = job.dir;
       this.stop(key);
-      // Не оставляем мёртвый playlist: при возврате на канал append к нему
-      // даёт прыжок wall-clock «в будущее». air-finish.json не трогаем.
+      // Do not leave a dead playlist: returning to the channel and appending to it
+      // jumps wall-clock into the future. Leave air-finish.json alone.
       void this.clearHlsFolder(dir).catch(() => undefined);
     }
   }
 
-  /** ffmpeg жив, но .ts не появляются (зависон на EOF/титрах/битом месте) → handoff + skip. */
+  /** ffmpeg is alive but .ts stop appearing (hang on EOF/credits/bad spot) → handoff + skip. */
   @Interval(10_000)
   async watchStalledEncodes() {
     const stallSec = Number(this.config.get('STREAM_STALL_SEC', 15));
@@ -502,7 +502,7 @@ export class FfmpegService implements OnModuleDestroy {
     );
     const listSize = String(this.config.get<number>('HLS_LIST_SIZE', 12));
     const hlsTime = String(this.config.get<number>('HLS_TIME', 2));
-    // temp_file: атомарная запись m3u8 (без окна, где Nest отдаёт 404 на playlist).
+    // temp_file: atomic m3u8 write (no window where Nest serves 404 on the playlist).
     const flags = append
       ? 'delete_segments+omit_endlist+independent_segments+append_list+temp_file'
       : 'delete_segments+omit_endlist+independent_segments+temp_file';
@@ -540,7 +540,7 @@ export class FfmpegService implements OnModuleDestroy {
     ];
   }
 
-  /** Быстрый mid-episode seek: -ss до -i (ключ. кадр), без concat inpoint. */
+  /** Fast mid-episode seek: -ss before -i (keyframe), no concat inpoint. */
   private buildHlsArgsFastSeek(
     mediaPath: string,
     inpointSec: number,
@@ -614,7 +614,7 @@ export class FfmpegService implements OnModuleDestroy {
     } catch {
       /* ignore */
     }
-    // Учитываем номера из m3u8 — иначе после timeout дыры: диск=4504, playlist уже 4513.
+    // Honor sequence numbers from m3u8 — otherwise gaps after timeout: disk=4504, playlist already 4513.
     try {
       const body = await readFile(join(dir, 'playlist.m3u8'), 'utf8');
       for (const line of body.split(/\r?\n/)) {
@@ -630,8 +630,8 @@ export class FfmpegService implements OnModuleDestroy {
   }
 
   /**
-   * Append имеет смысл только пока HLS «живой» (стык серий / мгновенный restart).
-   * После idle/смены канала сегменты остывают → fresh.
+   * Append only makes sense while HLS is "live" (episode seam / instant restart).
+   * After idle/channel switch segments go cold → fresh.
    */
   async isPlaylistFresh(dir: string, maxAgeSec?: number): Promise<boolean> {
     const hlsTime = Number(this.config.get('HLS_TIME', 2));
@@ -651,7 +651,7 @@ export class FfmpegService implements OnModuleDestroy {
     return ageMs <= maxSec * 1000;
   }
 
-  /** Append только если все .ts из m3u8 реально на диске. */
+  /** Append only if every .ts listed in m3u8 is actually on disk. */
   private async isPlaylistAppendable(dir: string): Promise<boolean> {
     const playlistPath = join(dir, 'playlist.m3u8');
     let body: string;
@@ -701,7 +701,7 @@ export class FfmpegService implements OnModuleDestroy {
           if (!m || Number(m[1]) < minSegment) continue;
           try {
             const st = await stat(join(dir, n));
-            // Новый сегмент этого spawn, не старый мусор.
+            // New segment from this spawn, not leftover junk.
             if (st.mtimeMs >= started - 2_000) return;
           } catch {
             /* retry */
@@ -722,7 +722,7 @@ export class FfmpegService implements OnModuleDestroy {
     } catch {
       return;
     }
-    // Не трогаем playlist.m3u8 — иначе hls.js ловит 404, пока ffmpeg пишет новый.
+    // Leave playlist.m3u8 alone — otherwise hls.js hits 404 while ffmpeg writes a new one.
     await Promise.all(
       names
         .filter((n) => n.endsWith('.ts'))
@@ -731,8 +731,8 @@ export class FfmpegService implements OnModuleDestroy {
   }
 
   /**
-   * Удаляет playlist*.ts, которых нет в текущем m3u8.
-   * ffmpeg delete_segments не чистит «дыры» после append/рестартов — оттуда мусор серий.
+   * Deletes playlist*.ts files that are not in the current m3u8.
+   * ffmpeg delete_segments does not clean "holes" after append/restarts — leftover episode junk.
    */
   private async sweepOrphanSegments(dir: string): Promise<void> {
     const playlistPath = join(dir, 'playlist.m3u8');
@@ -759,7 +759,7 @@ export class FfmpegService implements OnModuleDestroy {
       return;
     }
 
-    // Не трогаем файлы младше 20с — ffmpeg мог ещё писать сегмент.
+    // Skip files younger than 20s — ffmpeg may still be writing the segment.
     const freshMs = 20_000;
     const now = Date.now();
     let removed = 0;

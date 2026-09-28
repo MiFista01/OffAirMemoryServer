@@ -38,10 +38,10 @@ type HlsSegmentInput = {
 };
 
 /**
- * Приоритет конца эфира:
- * 1) Целостность текущего/последнего мульта — доиграть до конца.
- * 2) Только когда мульт реально закончился → off air + wipe HLS.
- * air-finish.json переживает рестарт Nest, пока фронт досматривает хвост.
+ * End-of-air priority:
+ * 1) Integrity of the current/last cartoon — play it through to the end.
+ * 2) Only when the cartoon truly finished → off air + wipe HLS.
+ * air-finish.json survives Nest restart while the frontend drains the tail.
  */
 @Injectable()
 export class StreamService implements OnModuleDestroy {
@@ -62,7 +62,7 @@ export class StreamService implements OnModuleDestroy {
     const folderName = streamFolderName(slug, tz, profile);
     const dir = join(streamRoot, folderName);
 
-    // 1) Живой encode — переподключаемся, НО не отдаём зависший на концовке.
+    // 1) Live encode — reconnect, BUT do not serve one stuck on the ending.
     const existing = this.ffmpeg.get(key);
     if (existing && this.ffmpeg.isJobAlive(existing)) {
       const stallSec = Number(this.config.get('STREAM_STALL_SEC', 15));
@@ -72,14 +72,14 @@ export class StreamService implements OnModuleDestroy {
 
       if (stalled) {
         const nearEnd = this.isJobNearEpisodeEnd(existing);
-        // Посреди серии не прыгаем вперёд — только перезапуск с wall-clock/cursor.
-        // У концовки — skip, иначе снова зависнем на EOF.
+        // Mid-episode we do not jump ahead — only restart from wall-clock/cursor.
+        // Near the ending — skip, otherwise we hang on EOF again.
         this.logger.warn(
           `[${key}] /start on stalled encode (age=${Math.round((ageMs ?? 0) / 1000)}s` +
             `${nearEnd ? ', near end → skip' : ', mid → restart'})`,
         );
         this.ffmpeg.stop(key);
-        // Append только если HLS ещё горячий; иначе fresh (без прыжка wall-clock).
+        // Append only if HLS is still hot; otherwise fresh (no wall-clock jump).
         const append = await this.ffmpeg.isPlaylistFresh(dir);
         if (nearEnd) {
           return this.runEncode(slug, tz, profile, append, 'wall-clock', {
@@ -99,8 +99,8 @@ export class StreamService implements OnModuleDestroy {
 
     const date = calendarDateInTz(tz);
 
-    // 2) После рестарта Nest: продолжить тот же мульт, что кодировали
-    // (не откатываться на wall-clock — skip/stall мог уйти вперёд сетки).
+    // 2) After Nest restart: continue the same cartoon we were encoding
+    // (do not fall back to wall-clock — skip/stall may have moved ahead of the grid).
     const finish = await readAirFinish(dir);
     if (finish) {
       if (finish.date && finish.date !== date) {
@@ -111,10 +111,10 @@ export class StreamService implements OnModuleDestroy {
         const idleSec = Number.isFinite(savedMs)
           ? Math.max(0, (Date.now() - savedMs) / 1000)
           : Number.POSITIVE_INFINITY;
-        // Свежий долг (рестарт / краткий idle) — resume.
-        // Старый хвост (> длительности + 2 мин) — уже не актуален.
+        // Fresh debt (restart / brief idle) — resume.
+        // Stale tail (> duration + 2 min) — no longer relevant.
         if (idleSec <= finish.durationSec + 120) {
-          // Хвост концовки (<90с) не переигрываем — сразу следующий.
+          // Ending tail (<90s) — do not replay; go to the next one.
           if (finish.durationSec < 90) {
             this.logger.log(
               `[${key}] air-finish tail ${finish.durationSec}s — skip to next`,
@@ -136,8 +136,8 @@ export class StreamService implements OnModuleDestroy {
       }
     }
 
-    // Холодный старт / возврат на канал: append только к горячему HLS.
-    // Иначе старый live-edge + mid-seek = «в будущее и обратно».
+    // Cold start / return to channel: append only to hot HLS.
+    // Otherwise stale live-edge + mid-seek = jump into the future and back.
     const append = await this.ffmpeg.isPlaylistFresh(dir);
     return this.runEncode(slug, tz, profile, append, 'wall-clock');
   }
@@ -148,7 +148,7 @@ export class StreamService implements OnModuleDestroy {
     return { channel: slug, key, stopped };
   }
 
-  /** Heartbeat зрителя (HLS / nginx auth_request) — не даёт idle TTL убить encode. */
+  /** Viewer heartbeat (HLS / nginx auth_request) — keeps idle TTL from killing encode. */
   heartbeat(slug: string, tz = 'Europe/Tallinn', profile = '720p') {
     const key = `${slug}:${tz}:${profile}`;
     const job = this.ffmpeg.get(key);
@@ -162,7 +162,7 @@ export class StreamService implements OnModuleDestroy {
     return { ok: touched, key, dir: join(streamRoot, folder) };
   }
 
-  /** Перед убийством ffmpeg при рестарте Nest — зафиксировать текущий мульт. */
+  /** Before killing ffmpeg on Nest restart — persist the current cartoon. */
   async onModuleDestroy() {
     await Promise.all(
       this.ffmpeg.listJobs().map(async (job) => {
@@ -186,7 +186,7 @@ export class StreamService implements OnModuleDestroy {
     );
   }
 
-  /** Окончательный конец эфира: стоп + wipe HLS + снять air-finish. */
+  /** Final end of air: stop + wipe HLS + clear air-finish. */
   async shutdownChannelStream(
     slug: string,
     tz: string,
@@ -208,10 +208,10 @@ export class StreamService implements OnModuleDestroy {
   }
 
   /**
-   * После конца куска encode:
-   * - файл серии реально доигран → не брать её снова по wall-clock (completedEpisodeIds);
-   * - в окне → следующие серии;
-   * - past window + overrun → доиграть только текущий;
+   * After an encode chunk ends:
+   * - episode file truly finished → do not pick it again via wall-clock (completedEpisodeIds);
+   * - still in window → next episodes;
+   * - past window + overrun → finish only the current one;
    * - stall past window → wipe.
    */
   private async continueEncode(
@@ -220,7 +220,7 @@ export class StreamService implements OnModuleDestroy {
     profile: string,
     opts?: {
       skipCurrent?: boolean;
-      /** Серии, которые ffmpeg уже полностью отдал в этом окне (code=0). */
+      /** Episodes ffmpeg already fully delivered in this window (code=0). */
       completedEpisodeIds?: number[];
     },
   ) {
@@ -247,7 +247,7 @@ export class StreamService implements OnModuleDestroy {
         ? isFinishingOverrun(day.scheduleItems, airStart, hours)
         : false;
 
-      // История для завтрашней сетки: доигранные серии.
+      // History for tomorrow's grid: fully played episodes.
       if (channel && opts?.completedEpisodeIds?.length) {
         void this.airHistory
           .recordFinishedMany(
@@ -262,7 +262,7 @@ export class StreamService implements OnModuleDestroy {
       }
 
       if (inWindow) {
-        // Всегда append: wipe .ts на стыке = дыра в эфире (пустое окно до первого сегмента).
+        // Always append: wiping .ts at the seam = a hole on air (empty window until the first segment).
         await this.runEncode(slug, tz, profile, true, 'wall-clock', {
           skipCurrent: !!opts?.skipCurrent,
           completedEpisodeIds: opts?.completedEpisodeIds,
@@ -276,7 +276,7 @@ export class StreamService implements OnModuleDestroy {
         return;
       }
 
-      // Доиграли файл, а сетка ещё «держит» слот → не крутить концовку снова.
+      // File finished but the grid still "holds" the slot → do not replay the ending.
       if (opts?.completedEpisodeIds?.length) {
         if (overrun) {
           const rem = day
@@ -329,7 +329,7 @@ export class StreamService implements OnModuleDestroy {
     return Number.isFinite(hours) ? hours : AIR_TIME_HOURS;
   }
 
-  /** Encode уже у концовки слота (durationSec на job = остаток на старте). */
+  /** Encode is already near the slot ending (job durationSec = remaining at start). */
   private isJobNearEpisodeEnd(job: {
     startedAt?: number;
     offsetSec?: number;
@@ -339,13 +339,13 @@ export class StreamService implements OnModuleDestroy {
     if (remainingAtStart <= 0) return false;
     const started = job.startedAt ?? Date.now();
     const elapsed = (Date.now() - started) / 1000;
-    // Раньше ошибочно сравнивали inpoint+elapsed с remaining → всегда «near end».
+    // Previously we wrongly compared inpoint+elapsed to remaining → always "near end".
     return elapsed >= Math.max(0, remainingAtStart - 60);
   }
 
   /**
-   * Сетка дня: сначала календарь канала (tz), иначе UTC (как в schedule builder).
-   * Иначе в 02:00 Tallinn берётся вчерашний UTC-день и seek/таймауты плывут.
+   * Day grid: prefer channel calendar (tz), else UTC (same as schedule builder).
+   * Otherwise at 02:00 Tallinn we pick yesterday's UTC day and seek/timeouts drift.
    */
   private async loadScheduleDay(channelId: number, tz: string) {
     const localDate = calendarDateInTz(tz);
@@ -367,8 +367,8 @@ export class StreamService implements OnModuleDestroy {
   }
 
   /**
-   * Таймер не важнее целостности мульта:
-   * живой encode и air-finish.json не трогаем.
+   * The timer does not outrank cartoon integrity:
+   * leave a live encode and air-finish.json alone.
    */
   @Interval(60_000)
   async enforceAirWindow() {
@@ -437,7 +437,7 @@ export class StreamService implements OnModuleDestroy {
     });
   }
 
-  /** Resume после рестарта: только этот файл до конца. */
+  /** Resume after restart: this file only, through to the end. */
   private async runFinishEncode(
     slug: string,
     tz: string,
@@ -454,7 +454,7 @@ export class StreamService implements OnModuleDestroy {
     let inpoint = finish.inpointSec;
     let duration = finish.durationSec;
 
-    // Пока Nest лежал, фронт мог досмотреть буфер — сдвигаем inpoint вперёд.
+    // While Nest was down the frontend may have drained the buffer — advance inpoint.
     const savedMs = Date.parse(finish.savedAt);
     if (Number.isFinite(savedMs)) {
       const idleSec = Math.max(0, Math.floor((Date.now() - savedMs) / 1000));
@@ -485,7 +485,7 @@ export class StreamService implements OnModuleDestroy {
       }
     }
 
-    // Уже у концовки — не переигрывать титры.
+    // Already at the ending — do not replay the credits.
     if (duration < 90) {
       this.logger.log(
         `[${key}] finish remaining ${duration}s — skip to next`,
@@ -544,7 +544,7 @@ export class StreamService implements OnModuleDestroy {
       streamRoot,
       folderName,
       segments,
-      // Resume тоже с append, если playlist жив — иначе дыра на стыке.
+      // Resume also uses append if the playlist is live — otherwise a seam hole.
       append: true,
       rollingHandoff: false,
       onNaturalEnd: ({ rolling }) => {
@@ -619,7 +619,7 @@ export class StreamService implements OnModuleDestroy {
     const overrun = isFinishingOverrun(day.scheduleItems, airStart, hours);
     const finishPending = await readAirFinish(dir);
 
-    // Off air только если нет доигровки и нет pending finish.
+    // Off air only if there is no overrun finish and no pending finish.
     this.businessValidation.assert(
       inWindow || overrun || !!finishPending,
       'Channel is off air',
@@ -632,8 +632,8 @@ export class StreamService implements OnModuleDestroy {
     let all = findRemainingPlaylist(day.scheduleItems, airStart);
     this.businessValidation.assertNotEmpty(all, 'Channel is off air');
 
-    // Файл уже доигран, а сетка ещё указывает на него (duration в БД > файла) —
-    // иначе концовка крутится 2–3 раза подряд.
+    // File already finished but the grid still points at it (DB duration > file) —
+    // otherwise the ending loops 2–3 times.
     if (opts?.completedEpisodeIds?.length) {
       const done = new Set(opts.completedEpisodeIds);
       let dropped = 0;
@@ -674,7 +674,7 @@ export class StreamService implements OnModuleDestroy {
       this.businessValidation.assert(false, 'Channel is off air');
     }
 
-    // Хвост < 90с — не кодируем концовку (hang + append-каша). Сразу следующий.
+    // Tail < 90s — do not encode the ending (hang + append mash). Go to the next one.
     const tailSkipSec = Number(this.config.get('STREAM_TAIL_SKIP_SEC', 90));
     let droppedTail = false;
     while (
@@ -708,7 +708,7 @@ export class StreamService implements OnModuleDestroy {
       all = [all[0]];
     }
 
-    // episode-start только если явно просили (сейчас нигде на continue/reconnect).
+    // episode-start only when explicitly requested (currently nowhere on continue/reconnect).
     if (align === 'episode-start' && all[0].inpointSec > 0) {
       const cur = all[0];
       all = [
@@ -723,7 +723,7 @@ export class StreamService implements OnModuleDestroy {
 
     const useLookahead =
       Number.isFinite(lookaheadSec) && lookaheadSec > 0;
-    // Mid-episode: только текущий файл (fast -ss).
+    // Mid-episode: current file only (fast -ss).
     const midEpisode = all[0].inpointSec > 5;
     const segments = midEpisode
       ? [all[0]]
@@ -731,8 +731,8 @@ export class StreamService implements OnModuleDestroy {
         ? this.capLookahead(all, lookaheadSec)
         : all;
 
-    // Append держим на стыках серий — иначе clear .ts → чёрный экран/пауза.
-    // «Каша концовки» лечится completedEpisodeIds, не wipe папки.
+    // Keep append at episode seams — otherwise clear .ts → black screen/pause.
+    // Ending mash is fixed via completedEpisodeIds, not by wiping the folder.
     const doAppend = append;
 
     const hlsSegments: HlsSegmentInput[] = segments.map((seg) => {
@@ -754,7 +754,7 @@ export class StreamService implements OnModuleDestroy {
     const remainingAtStart = first.durationSec;
     const encodeStartedAt = Date.now();
 
-    // Курсор эфира: всегда пишем — после рестарта Nest не откатываемся по wall-clock.
+    // Air cursor: always write — after Nest restart we do not roll back to wall-clock.
     await writeAirFinish(dir, {
       date,
       episodeId: firstEp.id,
@@ -776,7 +776,7 @@ export class StreamService implements OnModuleDestroy {
       rollingHandoff: useLookahead && !midEpisode,
       onNaturalEnd: ({ rolling }) => {
         void this.continueEncode(slug, tz, profile, {
-          // Окно из одной серии доиграно → всегда помечаем completed.
+          // Single-episode window finished → always mark completed.
           completedEpisodeIds: rolling
             ? undefined
             : encodedEpisodeIds,
@@ -791,7 +791,7 @@ export class StreamService implements OnModuleDestroy {
           void this.continueEncode(slug, tz, profile);
           return;
         }
-        // Solo/fastSeek: stall после seek ≈ EOF/титры (файл короче сетки).
+        // Solo/fastSeek: stall after seek ≈ EOF/credits (file shorter than the grid).
         const solo = hlsSegments.length === 1;
         const nearEnd =
           solo || elapsed >= Math.max(0, remainingAtStart - 60);
@@ -831,9 +831,9 @@ export class StreamService implements OnModuleDestroy {
   }
 
   /**
-   * Готов ли HLS. Лёгкий поллинг (~2с).
-   * ensure=true — если эфир есть, а encode ещё нет (типично после рестарта Nest /
-   * смены канала), поднять через /start и вернуть starting|live.
+   * Whether HLS is ready. Light polling (~2s).
+   * ensure=true — if on air but encode is not running yet (typical after Nest restart /
+   * channel switch), start via /start and return starting|live.
    * status: live | starting | idle | off
    */
   async status(
@@ -889,7 +889,7 @@ export class StreamService implements OnModuleDestroy {
         ready: false,
         playable: false,
         status: 'starting' as const,
-        // URL ещё нельзя кормить в hls.js — будет лавина 404.
+        // Do not feed the URL to hls.js yet — would cause a 404 storm.
         streamUrl: null as string | null,
         ageSec: ageMs != null ? Math.round(ageMs / 1000) : null,
         pollAfterMs: 2000,
@@ -897,7 +897,7 @@ export class StreamService implements OnModuleDestroy {
       };
     }
 
-    // Нет job: либо ещё не стартовали (после рестарта / смены канала), либо off air.
+    // No job: either not started yet (after restart / channel switch), or off air.
     const onAir = await this.isChannelOnAir(slug, tz, profile);
     if (!onAir) {
       return {
@@ -962,7 +962,7 @@ export class StreamService implements OnModuleDestroy {
     };
   }
 
-  /** В окне эфира / overrun / air-finish — можно поднимать encode. */
+  /** In the air window / overrun / air-finish — encode may be started. */
   private async isChannelOnAir(
     slug: string,
     tz: string,

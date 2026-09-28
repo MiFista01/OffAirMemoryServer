@@ -54,7 +54,7 @@ export function windowStartAt(
   return new Date(asUtc - tzOffsetMs(tz, once));
 }
 
-/** Конец эфирного окна: start + N часов. */
+/** End of the air window: start + N hours. */
 export function windowEndAt(airStart: Date, airTimeHours: number): Date {
   return new Date(airStart.getTime() + airTimeHours * 60 * 60 * 1000);
 }
@@ -69,8 +69,8 @@ export function isWithinAirWindow(
 }
 
 /**
- * Эпизоды, чей старт < конца окна. Текущий может зайти за лимит и доиграться;
- * следующие после cutoff в concat не попадают.
+ * Episodes whose start is before the window end. The current one may overrun and finish;
+ * later ones after the cutoff are not added to concat.
  */
 export function trimPlaylistToAirEnd(
   remaining: PlaylistSegment[],
@@ -80,7 +80,7 @@ export function trimPlaylistToAirEnd(
 ): PlaylistSegment[] {
   if (!remaining.length) return remaining;
   const windowEnd = windowEndAt(airStart, airTimeHours).getTime();
-  // абсолютное начало текущего слота
+  // absolute start of the current slot
   let absStart = now.getTime() - remaining[0].inpointSec * 1000;
   const out: PlaylistSegment[] = [];
   for (const seg of remaining) {
@@ -91,7 +91,7 @@ export function trimPlaylistToAirEnd(
   return out;
 }
 
-/** После лимита: доигрываем только слот, который начался до конца окна. */
+/** After the limit: finish only the slot that started before the window end. */
 export function isFinishingOverrun(
   items: ScheduleItem[],
   airStart: Date,

@@ -3,9 +3,9 @@ import { join } from 'path';
 
 export const AIR_FINISH_FILE = 'air-finish.json';
 
-/** Персист доигровки последнего мульта (переживает рестарт Nest). */
+/** Persist finish-overrun of the last cartoon (survives Nest restart). */
 export type AirFinishState = {
-  /** Календарный день эфира (YYYY-MM-DD в tz канала). */
+  /** Calendar air day (YYYY-MM-DD in channel tz). */
   date: string;
   episodeId: number;
   mediaPath: string;
