@@ -1,4 +1,4 @@
-import { access, readFile, rm, writeFile } from 'fs/promises';
+import { access, chmod, mkdir, readFile, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 
 export const AIR_FINISH_FILE = 'air-finish.json';
@@ -37,11 +37,15 @@ export async function writeAirFinish(
   dir: string,
   state: AirFinishState,
 ): Promise<void> {
+  // /start writes air-finish before ffmpeg mkdir — cold STREAM_ROOT → ENOENT → 500
+  await mkdir(dir, { recursive: true });
+  await chmod(dir, 0o755).catch(() => undefined);
   await writeFile(
     airFinishPath(dir),
     JSON.stringify({ ...state, savedAt: new Date().toISOString() }, null, 2),
     'utf8',
   );
+  await chmod(airFinishPath(dir), 0o644).catch(() => undefined);
 }
 
 export async function clearAirFinish(dir: string): Promise<void> {

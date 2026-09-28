@@ -93,11 +93,12 @@ export function trimPlaylistToAirEnd(
 
 /** After the limit: finish only the slot that started before the window end. */
 export function isFinishingOverrun(
-  items: ScheduleItem[],
+  items: ScheduleItem[] | null | undefined,
   airStart: Date,
   airTimeHours: number,
   now = new Date(),
 ): boolean {
+  if (!items?.length) return false;
   if (isWithinAirWindow(airStart, airTimeHours, now)) return false;
   if (now.getTime() < airStart.getTime()) return false;
 
@@ -131,10 +132,11 @@ export function parseStreamKey(key: string): {
 }
 
 export function findCurrentSlot(
-  items: ScheduleItem[],
+  items: ScheduleItem[] | null | undefined,
   airStart: Date,
   now = new Date(),
 ): { item: ScheduleItem; offsetSec: number } | null {
+  if (!items?.length) return null;
   const sorted = [...items].sort((a, b) => a.order - b.order);
   let cursor = airStart.getTime();
 
@@ -161,10 +163,11 @@ export function streamFolderName(
 }
 
 export function findRemainingPlaylist(
-  items: ScheduleItem[],
+  items: ScheduleItem[] | null | undefined,
   airStart: Date,
   now = new Date(),
 ): PlaylistSegment[] | null {
+  if (!items?.length) return null;
   const sorted = [...items].sort((a, b) => a.order - b.order);
   let cursor = airStart.getTime();
   const out: PlaylistSegment[] = [];

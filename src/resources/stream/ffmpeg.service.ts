@@ -9,7 +9,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { Interval } from '@nestjs/schedule';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
-import { access, mkdir, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
+import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 
 @Injectable()
@@ -177,6 +177,8 @@ export class FfmpegService implements OnModuleDestroy {
 
     const dir = join(opts.streamRoot, opts.folderName);
     await mkdir(dir, { recursive: true });
+    // Synology/ACL: nginx (www) must read files created by root in the server container
+    await chmod(dir, 0o755).catch(() => undefined);
 
     let append = !!opts.append;
     if (append && !(await this.isPlaylistAppendable(dir))) {
@@ -236,7 +238,7 @@ export class FfmpegService implements OnModuleDestroy {
 
     this.logger.log(
       `[${opts.key}] segs=${opts.segments.length} append=${append} start=${startNumber}` +
-        `${useFastSeek ? ' fastSeek' : ''}`,
+        `${useFastSeek ? ' fastSeek' : ''} hw=${this.hwMode()}`,
     );
     this.stop(opts.key);
     this.stopped.delete(opts.key);
@@ -485,22 +487,54 @@ export class FfmpegService implements OnModuleDestroy {
     }
   }
 
+  private hwMode(): 'none' | 'vaapi' | 'qsv' {
+    const raw = (this.config.get<string>('FFMPEG_HW', 'none') ?? 'none')
+      .trim()
+      .toLowerCase();
+    if (raw === 'vaapi' || raw === 'qsv') return raw;
+    return 'none';
+  }
+
+  /** Must appear before `-i` (VAAPI device init). */
+  private hwInitArgs(): string[] {
+    if (this.hwMode() !== 'vaapi') return [];
+    const dev = this.config.get<string>(
+      'FFMPEG_VAAPI_DEVICE',
+      '/dev/dri/renderD128',
+    );
+    return ['-init_hw_device', `vaapi=va:${dev}`, '-filter_hw_device', 'va'];
+  }
+
+  private videoEncodeArgs(): string[] {
+    const override = this.config.get<string>('FFMPEG_VIDEO_ARGS');
+    if (override?.trim()) return this.parseArgs(override);
+
+    if (this.hwMode() === 'vaapi') {
+      // iGPU (Intel UHD on 8505): encode off CPU. Soft decode → hwupload → h264_vaapi.
+      return this.parseArgs(
+        '-vf format=nv12,hwupload -c:v h264_vaapi -b:v 4000k -maxrate 4500k -bufsize 8000k -g 48',
+      );
+    }
+    if (this.hwMode() === 'qsv') {
+      return this.parseArgs(
+        '-c:v h264_qsv -preset veryfast -global_quality 21 -look_ahead 0 -b:v 4000k -maxrate 4500k -bufsize 8000k -g 48',
+      );
+    }
+    return this.parseArgs(
+      '-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p -crf 19 -maxrate 4000k -bufsize 8000k -g 48 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv',
+    );
+  }
+
   private buildHlsArgs(
     listPath: string,
     playlist: string,
     append: boolean,
     startNumber: number,
   ): string[] {
-    const videoArgs = this.parseArgs(
-      this.config.get<string>(
-        'FFMPEG_VIDEO_ARGS',
-        '-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p -crf 19 -maxrate 4000k -bufsize 8000k -g 48 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv',
-      ),
-    );
     const audioArgs = this.parseArgs(
       this.config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 160k'),
     );
-    const listSize = String(this.config.get<number>('HLS_LIST_SIZE', 12));
+    const listSize = String(this.config.get<number>('HLS_LIST_SIZE', 30));
     const hlsTime = String(this.config.get<number>('HLS_TIME', 2));
     // temp_file: atomic m3u8 write (no window where Nest serves 404 on the playlist).
     const flags = append
@@ -511,6 +545,7 @@ export class FfmpegService implements OnModuleDestroy {
       '-hide_banner',
       '-loglevel',
       'warning',
+      ...this.hwInitArgs(),
       '-re',
       '-fflags',
       '+genpts',
@@ -520,7 +555,7 @@ export class FfmpegService implements OnModuleDestroy {
       '0',
       '-i',
       listPath,
-      ...videoArgs,
+      ...this.videoEncodeArgs(),
       ...audioArgs,
       '-avoid_negative_ts',
       'make_zero',
@@ -531,7 +566,7 @@ export class FfmpegService implements OnModuleDestroy {
       '-hls_list_size',
       listSize,
       '-hls_delete_threshold',
-      '6',
+      '12',
       '-start_number',
       String(startNumber),
       '-hls_flags',
@@ -549,16 +584,10 @@ export class FfmpegService implements OnModuleDestroy {
     append: boolean,
     startNumber: number,
   ): string[] {
-    const videoArgs = this.parseArgs(
-      this.config.get<string>(
-        'FFMPEG_VIDEO_ARGS',
-        '-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p -crf 19 -maxrate 4000k -bufsize 8000k -g 48 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv',
-      ),
-    );
     const audioArgs = this.parseArgs(
       this.config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 160k'),
     );
-    const listSize = String(this.config.get<number>('HLS_LIST_SIZE', 12));
+    const listSize = String(this.config.get<number>('HLS_LIST_SIZE', 30));
     const hlsTime = String(this.config.get<number>('HLS_TIME', 2));
     const flags = append
       ? 'delete_segments+omit_endlist+independent_segments+append_list+temp_file'
@@ -570,6 +599,7 @@ export class FfmpegService implements OnModuleDestroy {
       '-hide_banner',
       '-loglevel',
       'warning',
+      ...this.hwInitArgs(),
       '-ss',
       String(ss),
       '-re',
@@ -579,7 +609,7 @@ export class FfmpegService implements OnModuleDestroy {
       mediaPath,
       '-t',
       String(dur),
-      ...videoArgs,
+      ...this.videoEncodeArgs(),
       ...audioArgs,
       '-avoid_negative_ts',
       'make_zero',
@@ -590,7 +620,7 @@ export class FfmpegService implements OnModuleDestroy {
       '-hls_list_size',
       listSize,
       '-hls_delete_threshold',
-      '6',
+      '12',
       '-start_number',
       String(startNumber),
       '-hls_flags',
@@ -635,11 +665,11 @@ export class FfmpegService implements OnModuleDestroy {
    */
   async isPlaylistFresh(dir: string, maxAgeSec?: number): Promise<boolean> {
     const hlsTime = Number(this.config.get('HLS_TIME', 2));
-    const listSize = Number(this.config.get('HLS_LIST_SIZE', 12));
+    const listSize = Number(this.config.get('HLS_LIST_SIZE', 30));
     const defaultMax = Math.max(
       20,
       (Number.isFinite(hlsTime) ? hlsTime : 2) *
-        Math.min(6, Number.isFinite(listSize) ? listSize : 12) +
+        Math.min(8, Number.isFinite(listSize) ? listSize : 30) +
         8,
     );
     const maxSec =

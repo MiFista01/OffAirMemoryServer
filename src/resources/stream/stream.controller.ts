@@ -6,6 +6,7 @@ import { ApiOperation } from '@nestjs/swagger';
 import { ParamsSlugDto, QueryBooleanDto, QueryStrDto, QueryStreamProfileDto } from '@dtos';
 import { StreamProfile } from '@app-types';
 import { Request } from 'express';
+import { SkipThrottle } from '@nestjs/throttler';
 
 @Controller('stream')
 export class StreamController {
@@ -15,6 +16,7 @@ export class StreamController {
   ) {}
 
   @Public()
+  @SkipThrottle()
   @Get('hls-touch')
   @ApiOperation({
     summary: 'Internal/nginx: touch encode by HLS folder name',
@@ -67,6 +69,7 @@ export class StreamController {
   }
 
   @Public()
+  @SkipThrottle()
   @Get(':slug/heartbeat')
   @ApiOperation({
     summary: 'Viewer heartbeat — keep ffmpeg alive while watching',

@@ -613,10 +613,11 @@ export class StreamService implements OnModuleDestroy {
 
     const day = await this.loadScheduleDay(channel.id, tz);
     this.businessValidation.assertExists(day, 'No schedule for today');
-
+    
+    const items = day.scheduleItems ?? [];
     const airStart = windowStartAt(date, airWindowStart, tz);
     const inWindow = isWithinAirWindow(airStart, hours);
-    const overrun = isFinishingOverrun(day.scheduleItems, airStart, hours);
+    const overrun = isFinishingOverrun(items, airStart, hours);
     const finishPending = await readAirFinish(dir);
 
     // Off air only if there is no overrun finish and no pending finish.
@@ -629,7 +630,7 @@ export class StreamService implements OnModuleDestroy {
       return this.runFinishEncode(slug, tz, profile, finishPending, append);
     }
 
-    let all = findRemainingPlaylist(day.scheduleItems, airStart);
+    let all = findRemainingPlaylist(items, airStart);
     this.businessValidation.assertNotEmpty(all, 'Channel is off air');
 
     // File already finished but the grid still points at it (DB duration > file) —
