@@ -1,4 +1,4 @@
-import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { CreateScheduleDayDto } from './dto/create-schedule-day.dto';
 import { UpdateScheduleDayDto } from './dto/update-schedule-day.dto';
@@ -23,6 +23,8 @@ export class ScheduleDayService
   >
   implements OnModuleInit
 {
+  private readonly logger = new Logger(ScheduleDayService.name);
+
   constructor(
     @InjectRepository(ScheduleDay)
     scheduleDayRepository: Repository<ScheduleDay>,
@@ -50,14 +52,29 @@ export class ScheduleDayService
       isActive: true,
     });
 
-    for (const channel of channels) {
-      await this.createChannelDay(channel.id, date, airTimeSec);
+    if (!channels.length) {
+      this.logger.warn(
+        `createDaySchedule(${date}): no active channels — activate channels/cartoons after scan`,
+      );
+      return { date, channels: 0, created: 0 };
     }
+
+    let created = 0;
+    for (const channel of channels) {
+      const made = await this.createChannelDay(channel.id, date, airTimeSec);
+      if (made) created += 1;
+    }
+    this.logger.log(
+      `createDaySchedule(${date}): activeChannels=${channels.length} daysCreated=${created}`,
+    );
+    return { date, channels: channels.length, created };
   }
 
+  /**
+   * Boot / after scan: fill missing days for today.
+   * Safe to call repeatedly — skips channels that already have a day.
+   */
   async onModuleInit() {
-    const date = todayUtcDate();
-    if (await this.findOne({ date })) return;
     await this.createDaySchedule();
   }
 
@@ -65,8 +82,8 @@ export class ScheduleDayService
     channelId: number,
     date: string,
     airTimeSec: number,
-  ) {
-    if (await this.findOne({ date, channelId })) return;
+  ): Promise<boolean> {
+    if (await this.findOne({ date, channelId })) return false;
 
     const cartoons = await this.cartoonService.findAllBySearch(
       { channelId, isActive: true },
@@ -78,6 +95,13 @@ export class ScheduleDayService
         'episodes.broadcastTags.windows',
       ],
     );
+
+    if (!cartoons.length) {
+      this.logger.warn(
+        `createChannelDay channel=${channelId} date=${date}: no active cartoons`,
+      );
+      return false;
+    }
 
     // Air history → cursors: Jack was aired → next after the last one in the log.
     // Tags / holiday / franchise roulette — unchanged in buildDayPlaylist.
@@ -94,8 +118,11 @@ export class ScheduleDayService
     );
 
     if (!items.length) {
+      this.logger.warn(
+        `createChannelDay channel=${channelId} date=${date}: empty playlist (need active cartoons with durationSec)`,
+      );
       await this.remove(scheduleDay.id);
-      return;
+      return false;
     }
 
     await this.scheduleItemService.createBulk({ entities: items });
@@ -105,5 +132,6 @@ export class ScheduleDayService
         cursorEpisode: cartoon.cursorEpisode,
       });
     }
+    return true;
   }
 }
