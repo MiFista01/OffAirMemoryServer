@@ -21,13 +21,15 @@ export const keyWithoutLike = ['createdAt', 'updatedAt', 'slug'];
 
 export const tokenCookieName = 'authToken';
 
-/** Daily on-air window start (local wall clock in viewer tz). */
+/** Defaults if env missing — prefer AIR_WINDOW_START / AIR_TIME_HOURS in .env */
 export const AIR_WINDOW_START = '08:00';
-export const airTimeHours = 15;
+export const AIR_TIME_HOURS = 15;
+/** @deprecated use AIR_TIME_HOURS */
+export const airTimeHours = AIR_TIME_HOURS;
 /** Public HLS path served by Nginx (must match deploy/nginx.conf). */
 export const STREAM_URL_PREFIX = '/stream';
-/** Stop ffmpeg if nobody called /start for this many seconds. */
-export const STREAM_IDLE_TTL_SEC = 300;
+/** Stop ffmpeg if nobody watched (HLS /start) for this many seconds. */
+export const STREAM_IDLE_TTL_SEC = 60;
 
 export enum BroadcastWindowKind {
   BOOST = 'boost',

@@ -64,6 +64,17 @@ export type FfmpegJob = {
   dir: string;
   playlistUrl: string; // /stream/.../playlist.m3u8
   lastAccessAt: number;
+  startedAt?: number;
+  /** Первый .ts уже есть — можно отдавать в плеер. */
+  ready?: boolean;
+  onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
+  episodeId?: number;
+  offsetSec?: number;
+  source?: string;
+  remainingCount?: number;
+  mediaPath?: string;
+  relativePath?: string;
+  durationSec?: number;
 };
 
 export enum StreamProfile {
