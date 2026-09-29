@@ -69,6 +69,7 @@ export type FfmpegJob = {
   ready?: boolean;
   onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
   episodeId?: number;
+  scheduleItemId?: number;
   offsetSec?: number;
   source?: string;
   remainingCount?: number;
