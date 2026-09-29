@@ -191,3 +191,42 @@ export function findRemainingPlaylist(
   }
   return started ? out : null;
 }
+
+/**
+ * Next grid items after episodes we just finished/skipped (schedule order).
+ * Used on encode seams so a late Transformers ending cannot wall-clock-skip Bakugan.
+ */
+export function findPlaylistAfterCompleted(
+  items: ScheduleItem[] | null | undefined,
+  completedEpisodeIds: number[],
+  hintScheduleItemId?: number,
+): PlaylistSegment[] | null {
+  if (!items?.length || !completedEpisodeIds.length) return null;
+  const sorted = [...items].sort((a, b) => a.order - b.order);
+  const done = new Set(completedEpisodeIds);
+  const epIdOf = (item: ScheduleItem) => item.episode?.id ?? item.episodeId;
+
+  let lastIdx = -1;
+  if (hintScheduleItemId != null) {
+    const hintIdx = sorted.findIndex((i) => i.id === hintScheduleItemId);
+    if (hintIdx >= 0) {
+      lastIdx = hintIdx;
+      for (let i = hintIdx; i < sorted.length; i++) {
+        if (done.has(epIdOf(sorted[i]))) lastIdx = i;
+        else break;
+      }
+    }
+  }
+  if (lastIdx < 0) {
+    for (let i = 0; i < sorted.length; i++) {
+      if (done.has(epIdOf(sorted[i]))) lastIdx = i;
+    }
+  }
+  if (lastIdx < 0 || lastIdx >= sorted.length - 1) return null;
+
+  return sorted.slice(lastIdx + 1).map((item) => ({
+    item,
+    inpointSec: 0,
+    durationSec: item.durationSec,
+  }));
+}

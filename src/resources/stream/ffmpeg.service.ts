@@ -11,6 +11,8 @@ import { Interval } from '@nestjs/schedule';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { access, chmod, mkdir, readdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
+import { writeAirFinish, readAirFinish } from './air-finish.state';
+import { calendarDateInTz, parseStreamKey } from './stream-air.util';
 
 @Injectable()
 export class FfmpegService implements OnModuleDestroy {
@@ -23,7 +25,32 @@ export class FfmpegService implements OnModuleDestroy {
   private readonly stallSkip = new Set<string>();
   private readonly handoffTimers = new Map<string, NodeJS.Timeout>();
 
+  /** Serialize folder wipes so /start cannot spawn into a half-deleted HLS dir. */
+  private readonly clearLocks = new Map<string, Promise<void>>();
+
   constructor(private readonly config: ConfigService) {}
+
+  /** Wait for any in-flight wipe on this key (call before writing new HLS). */
+  async waitForClear(key: string): Promise<void> {
+    const pending = this.clearLocks.get(key);
+    if (pending) await pending.catch(() => undefined);
+  }
+
+  private enqueueClear(key: string, dir: string): Promise<void> {
+    const prev = this.clearLocks.get(key) ?? Promise.resolve();
+    const run = prev
+      .catch(() => undefined)
+      .then(async () => {
+        await this.clearHlsFolder(dir);
+      });
+    this.clearLocks.set(
+      key,
+      run.finally(() => {
+        if (this.clearLocks.get(key) === run) this.clearLocks.delete(key);
+      }),
+    );
+    return run;
+  }
 
   get(key: string) {
     return this.jobs.get(key);
@@ -90,19 +117,9 @@ export class FfmpegService implements OnModuleDestroy {
         /* previous attempt failed — try ourselves */
       }
       const existing = this.jobs.get(opts.key);
-      if (existing && this.isAlive(existing)) {
-        const playlist = join(
-          opts.streamRoot,
-          opts.folderName,
-          'playlist.m3u8',
-        );
-        try {
-          await access(playlist);
-          existing.lastAccessAt = Date.now();
-          return existing;
-        } catch {
-          /* fall through to restart */
-        }
+      if (existing && this.isAlive(existing) && !this.isSeekStuck(existing)) {
+        existing.lastAccessAt = Date.now();
+        return existing;
       }
     }
 
@@ -115,6 +132,22 @@ export class FfmpegService implements OnModuleDestroy {
         this.startLocks.delete(opts.key);
       }
     }
+  }
+
+  private startGraceSec(): number {
+    const startGraceSec = Number(
+      this.config.get('STREAM_START_GRACE_SEC', 180),
+    );
+    return Number.isFinite(startGraceSec) && startGraceSec > 0
+      ? startGraceSec
+      : 180;
+  }
+
+  /** Alive but never wrote playlist past grace — safe to kill/restart. */
+  private isSeekStuck(job: FfmpegJob): boolean {
+    if (job.ready) return false;
+    if (job.startedAt == null) return false;
+    return Date.now() - job.startedAt > this.startGraceSec() * 1000;
   }
 
   private isAlive(job: FfmpegJob): boolean {
@@ -166,7 +199,14 @@ export class FfmpegService implements OnModuleDestroy {
           existing.lastAccessAt = Date.now();
           return existing;
         } catch {
-          this.logger.warn(`[${opts.key}] playlist missing — restarting ffmpeg`);
+          // Concurrent /start during seek — keep the first encode unless stuck.
+          if (!this.isSeekStuck(existing)) {
+            existing.lastAccessAt = Date.now();
+            return existing;
+          }
+          this.logger.warn(
+            `[${opts.key}] playlist missing after grace — restarting ffmpeg`,
+          );
           this.stop(opts.key);
         }
       } else {
@@ -176,6 +216,8 @@ export class FfmpegService implements OnModuleDestroy {
     }
 
     const dir = join(opts.streamRoot, opts.folderName);
+    // Idle wipe may still be deleting .ts — never spawn into a half-empty folder.
+    await this.waitForClear(opts.key);
     await mkdir(dir, { recursive: true });
     // Synology/ACL: nginx (www) must read files created by root in the server container
     await chmod(dir, 0o755).catch(() => undefined);
@@ -199,7 +241,7 @@ export class FfmpegService implements OnModuleDestroy {
     // Fresh: remove old m3u8/.ts, otherwise the player briefly eats the previous live-edge.
     // Append (episode seam in the same air window) — leave alone, or a gap until the first .ts.
     if (!append) {
-      await this.clearHlsFolder(dir);
+      await this.enqueueClear(opts.key, dir);
     }
 
     const startNumber = append ? await this.nextStartNumber(dir) : 0;
@@ -256,6 +298,7 @@ export class FfmpegService implements OnModuleDestroy {
 
       this.clearHandoffTimer(opts.key);
       this.logger.log(`[${opts.key}] ffmpeg exit code=${code} signal=${signal}`);
+      const deadJob = current ?? undefined;
       this.jobs.delete(opts.key);
       const rolling = this.rollingHandoff.delete(opts.key);
       const fromStall = this.stallSkip.delete(opts.key);
@@ -266,12 +309,29 @@ export class FfmpegService implements OnModuleDestroy {
         );
         return;
       }
+      if (!opts.onNaturalEnd) return;
       if (code === 0 || rolling) {
-        if (!opts.onNaturalEnd) return;
         void Promise.resolve(opts.onNaturalEnd({ rolling })).catch((e) =>
           this.logger.error(`[${opts.key}] restart failed: ${e}`),
         );
+        return;
       }
+      // Crash — persist playhead, then rolling resume (NOT wall-clock skip).
+      this.logger.warn(
+        `[${opts.key}] ffmpeg died unexpectedly code=${code} signal=${signal} — resume cursor`,
+      );
+      void (async () => {
+        if (deadJob) {
+          try {
+            await this.persistJobCursor(deadJob, true);
+          } catch (e) {
+            this.logger.warn(`[${opts.key}] crash cursor save failed: ${e}`);
+          }
+        }
+        await Promise.resolve(opts.onNaturalEnd!({ rolling: true }));
+      })().catch((e) =>
+        this.logger.error(`[${opts.key}] crash restart failed: ${e}`),
+      );
     });
 
     const job: FfmpegJob = {
@@ -297,6 +357,34 @@ export class FfmpegService implements OnModuleDestroy {
           `[${opts.key}] rolling handoff (~${leadSec}s before window end)`,
         );
         this.rollingHandoff.add(opts.key);
+        child.kill('SIGTERM');
+      }, delayMs);
+      this.handoffTimers.set(opts.key, timer);
+    } else if (
+      // Mid-episode solo: ffmpeg often hangs on credits/EOF and never exits.
+      // Without a timer we only recover via stall (or channel switch → /start).
+      !opts.rollingHandoff &&
+      opts.segments.length === 1 &&
+      (opts.onStallEnd || opts.onNaturalEnd) &&
+      windowSec >= 25
+    ) {
+      const earlySec = Math.min(
+        10,
+        Math.max(4, Math.floor(windowSec * 0.04)),
+      );
+      const delayMs = Math.max(12_000, (windowSec - earlySec) * 1000);
+      const timer = setTimeout(() => {
+        const current = this.jobs.get(opts.key);
+        if (!current || current.process !== child) return;
+        this.logger.log(
+          `[${opts.key}] solo seam handoff (~${earlySec}s before window end, ${windowSec}s slot)`,
+        );
+        // Prefer stall-skip path → completedEpisodeIds + next slot (Time Squad → Dexter)
+        if (opts.onStallEnd) {
+          this.stallSkip.add(opts.key);
+        } else {
+          this.rollingHandoff.add(opts.key);
+        }
         child.kill('SIGTERM');
       }, delayMs);
       this.handoffTimers.set(opts.key, timer);
@@ -353,7 +441,7 @@ export class FfmpegService implements OnModuleDestroy {
         if (append && !opts._freshRetry) {
           this.logger.warn(`[${opts.key}] retry fresh HLS after deferred fail`);
           try {
-            await this.clearHlsFolder(dir);
+            await this.enqueueClear(opts.key, dir);
             await this.startHlsUnlocked({
               ...opts,
               append: false,
@@ -411,7 +499,7 @@ export class FfmpegService implements OnModuleDestroy {
     const dir = job?.dir;
     const stopped = this.stop(key);
     if (dir) {
-      await this.clearHlsFolder(dir);
+      await this.enqueueClear(key, dir);
     }
     return stopped;
   }
@@ -422,21 +510,72 @@ export class FfmpegService implements OnModuleDestroy {
       this.config.get('STREAM_IDLE_TTL_SEC', STREAM_IDLE_TTL_SEC),
     );
     const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? ttlSec : STREAM_IDLE_TTL_SEC;
+    const grace = this.startGraceSec();
     const cutoff = Date.now() - ttl * 1000;
     for (const [key, job] of this.jobs) {
       if (this.isAlive(job)) {
         void this.sweepOrphanSegments(job.dir).catch(() => undefined);
       }
       if (job.lastAccessAt >= cutoff) continue;
+      // Cold seek on NAS often > TTL — don't wipe while first playlist is pending.
+      if (!job.ready && !this.isSeekStuck(job)) {
+        continue;
+      }
+      // Mark touched so the next 15s tick doesn't double-reap while we await disk.
+      job.lastAccessAt = Date.now();
       this.logger.log(
         `[${key}] idle ${ttl}s (no viewers) — stopping ffmpeg + clear HLS`,
       );
       const dir = job.dir;
-      this.stop(key);
-      // Do not leave a dead playlist: returning to the channel and appending to it
-      // jumps wall-clock into the future. Leave air-finish.json alone.
-      void this.clearHlsFolder(dir).catch(() => undefined);
+      void (async () => {
+        try {
+          await this.persistJobCursor(job, true);
+        } catch (e) {
+          this.logger.warn(`[${key}] idle cursor save failed: ${e}`);
+        }
+        this.stop(key);
+        try {
+          await this.enqueueClear(key, dir);
+        } catch (e) {
+          this.logger.warn(`[${key}] idle HLS clear failed: ${e}`);
+        }
+      })();
     }
+  }
+
+  /** Persist air cursor at encode playhead (idle kill / crash / Nest destroy). */
+  async persistJobCursor(
+    job: FfmpegJob,
+    bumpGeneration = false,
+  ): Promise<void> {
+    if (!job.mediaPath || !job.episodeId || !job.durationSec) return;
+    const elapsed = Math.max(
+      0,
+      (Date.now() - (job.startedAt ?? Date.now())) / 1000,
+    );
+    const inpoint = Math.floor((job.offsetSec ?? 0) + elapsed);
+    const remain = Math.max(1, Math.floor(job.durationSec - elapsed));
+    const { tz } = parseStreamKey(job.key);
+    const prev = await readAirFinish(job.dir);
+    const generation = bumpGeneration
+      ? (prev?.generation ?? 0) + 1
+      : (prev?.generation ?? 1);
+    await writeAirFinish(job.dir, {
+      date: calendarDateInTz(tz),
+      episodeId: job.episodeId,
+      scheduleItemId: job.scheduleItemId,
+      mediaPath: job.mediaPath,
+      relativePath: job.relativePath ?? '',
+      inpointSec: inpoint,
+      durationSec: remain,
+      source: job.source ?? 'regular',
+      policy: 'continuous',
+      generation,
+      savedAt: new Date().toISOString(),
+    });
+    this.logger.log(
+      `[${job.key}] cursor → +${inpoint}s remain=${remain}s gen=${generation}`,
+    );
   }
 
   /** ffmpeg is alive but .ts stop appearing (hang on EOF/credits/bad spot) → handoff + skip. */
@@ -682,7 +821,12 @@ export class FfmpegService implements OnModuleDestroy {
   }
 
   /** Append only if every .ts listed in m3u8 is actually on disk. */
-  private async isPlaylistAppendable(dir: string): Promise<boolean> {
+  async isPlaylistAppendable(dir: string): Promise<boolean> {
+    return this.isPlaylistAppendableInternal(dir);
+  }
+
+  /** Append only if every .ts listed in m3u8 is actually on disk. */
+  private async isPlaylistAppendableInternal(dir: string): Promise<boolean> {
     const playlistPath = join(dir, 'playlist.m3u8');
     let body: string;
     try {

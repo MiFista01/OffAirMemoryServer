@@ -19,6 +19,7 @@ import {
 } from './air-finish.state';
 import {
   calendarDateInTz,
+  findPlaylistAfterCompleted,
   findRemainingPlaylist,
   isFinishingOverrun,
   isWithinAirWindow,
@@ -47,6 +48,10 @@ type HlsSegmentInput = {
 @Injectable()
 export class StreamService implements OnModuleDestroy {
   private readonly logger = new Logger(StreamService.name);
+  /** Serialize continueEncode / start per channel key — no overlapping seams. */
+  private readonly continueLocks = new Map<string, Promise<void>>();
+  /** Crash→resumeCursor loops on a bad file — skip after N. */
+  private readonly crashResumeCounts = new Map<string, number>();
 
   constructor(
     private readonly config: ConfigService,
@@ -58,6 +63,37 @@ export class StreamService implements OnModuleDestroy {
   ) {}
 
   async start(slug: string, tz = 'Europe/Tallinn', profile = '720p') {
+    const key = `${slug}:${tz}:${profile}`;
+    return this.withChannelLock(key, () => this.startUnlocked(slug, tz, profile));
+  }
+
+  private async withChannelLock<T>(
+    key: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prev = this.continueLocks.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const chain = prev.then(() => gate);
+    this.continueLocks.set(key, chain);
+    await prev.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this.continueLocks.get(key) === chain) {
+        this.continueLocks.delete(key);
+      }
+    }
+  }
+
+  private async startUnlocked(
+    slug: string,
+    tz: string,
+    profile: string,
+  ) {
     const key = `${slug}:${tz}:${profile}`;
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
     const folderName = streamFolderName(slug, tz, profile);
@@ -90,6 +126,35 @@ export class StreamService implements OnModuleDestroy {
               : undefined,
           });
         }
+        // Mid-stall: resume same cartoon from job cursor, not wall-clock.
+        if (
+          existing.mediaPath &&
+          existing.episodeId &&
+          existing.durationSec
+        ) {
+          const elapsed = Math.max(
+            0,
+            (Date.now() - (existing.startedAt ?? Date.now())) / 1000,
+          );
+          const finish = {
+            date: calendarDateInTz(tz),
+            episodeId: existing.episodeId,
+            scheduleItemId: existing.scheduleItemId,
+            mediaPath: existing.mediaPath,
+            relativePath: existing.relativePath ?? '',
+            inpointSec: Math.floor((existing.offsetSec ?? 0) + elapsed),
+            durationSec: Math.max(
+              1,
+              Math.floor(existing.durationSec - elapsed),
+            ),
+            source: existing.source ?? 'regular',
+            policy: 'continuous' as const,
+            generation: 1,
+            savedAt: new Date().toISOString(),
+          };
+          await writeAirFinish(dir, finish);
+          return this.runFinishEncode(slug, tz, profile, finish, append);
+        }
         return this.runEncode(slug, tz, profile, append, 'wall-clock');
       }
 
@@ -100,40 +165,44 @@ export class StreamService implements OnModuleDestroy {
 
     const date = calendarDateInTz(tz);
 
-    // 2) After Nest restart: continue the same cartoon we were encoding
-    // (do not fall back to wall-clock — skip/stall may have moved ahead of the grid).
+    // 2) Resume the cartoon we were encoding (idle kill / Nest restart / cold HLS).
+    // Never fall back to wall-clock while the cursor is still valid — that jumps
+    // W.I.T.C.H. ending → Dragon Hunters just because the schedule moved on.
     const finish = await readAirFinish(dir);
     if (finish) {
       if (finish.date && finish.date !== date) {
         this.logger.log(`[${key}] stale air-finish date=${finish.date} → drop`);
         await clearAirFinish(dir);
       } else {
+        // Long absence: continuous debt would replay hours behind the grid.
+        // Cap idle since cursor save — then catch up to wall-clock.
+        const maxIdleSec = Number(
+          this.config.get('STREAM_CURSOR_MAX_IDLE_SEC', 45 * 60),
+        );
+        const maxIdle =
+          Number.isFinite(maxIdleSec) && maxIdleSec > 0
+            ? maxIdleSec
+            : 45 * 60;
         const savedMs = Date.parse(finish.savedAt);
-        const idleSec = Number.isFinite(savedMs)
+        const cursorIdle = Number.isFinite(savedMs)
           ? Math.max(0, (Date.now() - savedMs) / 1000)
           : Number.POSITIVE_INFINITY;
-        // Fresh debt (restart / brief idle) — resume.
-        // Stale tail (> duration + 2 min) — no longer relevant.
-        if (idleSec <= finish.durationSec + 120) {
-          // Ending tail (<90s) — do not replay; go to the next one.
-          if (finish.durationSec < 90) {
-            this.logger.log(
-              `[${key}] air-finish tail ${finish.durationSec}s — skip to next`,
-            );
-            await clearAirFinish(dir);
-            return this.runEncode(slug, tz, profile, false, 'wall-clock', {
-              completedEpisodeIds: [finish.episodeId],
-            });
-          }
+        const debtCap = Math.max(finish.durationSec + 120, maxIdle);
+        if (cursorIdle > debtCap) {
           this.logger.log(
-            `[${key}] resume encode cursor episode=${finish.episodeId} +${finish.inpointSec}s (idle ${Math.round(idleSec)}s)`,
+            `[${key}] air cursor idle ${Math.round(cursorIdle)}s > ${Math.round(debtCap)}s — wall-clock catch-up`,
           );
-          return this.runFinishEncode(slug, tz, profile, finish, true);
+          await clearAirFinish(dir);
+        } else {
+          const cold = !(await this.ffmpeg.isPlaylistFresh(dir));
+          this.logger.log(
+            `[${key}] resume encode cursor episode=${finish.episodeId} +${finish.inpointSec}s` +
+              ` remain=${finish.durationSec}s policy=${finish.policy ?? 'continuous'}` +
+              `${cold ? ' (cold HLS)' : ''}`,
+          );
+          // Cold HLS: never append — wiped folder + append_list = zombie SN 404s.
+          return this.runFinishEncode(slug, tz, profile, finish, false);
         }
-        this.logger.log(
-          `[${key}] air-finish too old (idle ${Math.round(idleSec)}s) → wall-clock`,
-        );
-        await clearAirFinish(dir);
       }
     }
 
@@ -163,23 +232,12 @@ export class StreamService implements OnModuleDestroy {
     return { ok: touched, key, dir: join(streamRoot, folder) };
   }
 
-  /** Before killing ffmpeg on Nest restart — persist the current cartoon. */
+  /** Before killing ffmpeg on Nest restart — persist the current cartoon playhead. */
   async onModuleDestroy() {
     await Promise.all(
       this.ffmpeg.listJobs().map(async (job) => {
-        if (!job.mediaPath || !job.episodeId || !job.durationSec) return;
         try {
-          const { tz } = parseStreamKey(job.key);
-          await writeAirFinish(job.dir, {
-            date: calendarDateInTz(tz),
-            episodeId: job.episodeId,
-            mediaPath: job.mediaPath,
-            relativePath: job.relativePath ?? '',
-            inpointSec: job.offsetSec ?? 0,
-            durationSec: job.durationSec,
-            source: job.source ?? 'regular',
-            savedAt: new Date().toISOString(),
-          });
+          await this.ffmpeg.persistJobCursor(job, true);
         } catch (e) {
           this.logger.warn(`onModuleDestroy finish save: ${e}`);
         }
@@ -223,6 +281,24 @@ export class StreamService implements OnModuleDestroy {
       skipCurrent?: boolean;
       /** Episodes ffmpeg already fully delivered in this window (code=0). */
       completedEpisodeIds?: number[];
+      /** Crash / rolling — resume air cursor, do not wall-clock skip. */
+      resumeCursor?: boolean;
+    },
+  ) {
+    const key = `${slug}:${tz}:${profile}`;
+    return this.withChannelLock(key, () =>
+      this.continueEncodeUnlocked(slug, tz, profile, opts),
+    );
+  }
+
+  private async continueEncodeUnlocked(
+    slug: string,
+    tz: string,
+    profile: string,
+    opts?: {
+      skipCurrent?: boolean;
+      completedEpisodeIds?: number[];
+      resumeCursor?: boolean;
     },
   ) {
     const key = `${slug}:${tz}:${profile}`;
@@ -239,6 +315,56 @@ export class StreamService implements OnModuleDestroy {
       const airStart = windowStartAt(date, airWindowStart, tz);
       const inWindow = isWithinAirWindow(airStart, hours);
       const finish = await readAirFinish(dir);
+
+      if (opts?.resumeCursor && finish) {
+        const crashes = (this.crashResumeCounts.get(key) ?? 0) + 1;
+        this.crashResumeCounts.set(key, crashes);
+        // Credits / last-row hang: don't re-encode the ending forever.
+        const channelEarly = await this.channels.findOne({
+          slug,
+          isActive: true,
+        });
+        const dayEarly = channelEarly
+          ? await this.loadScheduleDay(channelEarly.id, tz)
+          : null;
+        const nextAfter = dayEarly
+          ? findPlaylistAfterCompleted(
+              dayEarly.scheduleItems,
+              [finish.episodeId],
+              finish.scheduleItemId,
+            )
+          : null;
+        const lastOrCredits =
+          !nextAfter?.length || finish.durationSec <= 120;
+        if (crashes > 3 || (crashes > 1 && lastOrCredits)) {
+          this.logger.warn(
+            `[${key}] crash resume x${crashes}` +
+              `${lastOrCredits ? ' (last/credits)' : ''} — advance past ${finish.episodeId}`,
+          );
+          this.crashResumeCounts.delete(key);
+          await clearAirFinish(dir);
+          if (inWindow && nextAfter?.length) {
+            await this.runEncode(slug, tz, profile, false, 'wall-clock', {
+              skipCurrent: true,
+              completedEpisodeIds: [finish.episodeId],
+            });
+            return;
+          }
+          // No next row (or past window) → off air
+          await this.shutdownChannelStream(slug, tz, profile);
+          return;
+        }
+        this.logger.log(
+          `[${key}] resume cursor after crash/handoff episode=${finish.episodeId} (try ${crashes})`,
+        );
+        await this.runFinishEncode(slug, tz, profile, finish, false);
+        return;
+      }
+
+      // Successful seam (not crash-loop) — reset breaker.
+      if (opts?.completedEpisodeIds?.length || opts?.skipCurrent) {
+        this.crashResumeCounts.delete(key);
+      }
 
       const channel = await this.channels.findOne({ slug, isActive: true });
       const day = channel
@@ -263,8 +389,37 @@ export class StreamService implements OnModuleDestroy {
       }
 
       if (inWindow) {
-        // Always append: wiping .ts at the seam = a hole on air (empty window until the first segment).
-        await this.runEncode(slug, tz, profile, true, 'wall-clock', {
+        // Last schedule row finished/skipped — go off air now (do not re-encode credits).
+        const seamDone =
+          opts?.completedEpisodeIds?.length || opts?.skipCurrent
+            ? (opts.completedEpisodeIds?.length
+                ? opts.completedEpisodeIds
+                : finish
+                  ? [finish.episodeId]
+                  : [])
+            : [];
+        if (seamDone.length && day) {
+          const next = findPlaylistAfterCompleted(
+            day.scheduleItems,
+            seamDone,
+            finish?.scheduleItemId,
+          );
+          if (!next?.length) {
+            this.logger.log(
+              `[${key}] end of schedule after ep=${seamDone.join(',')} → off air`,
+            );
+            await this.shutdownChannelStream(slug, tz, profile);
+            return;
+          }
+        }
+
+        // Append only while HLS is hot+complete — otherwise zombie m3u8 (404 storm).
+        const append =
+          !!opts?.skipCurrent ||
+          !!opts?.completedEpisodeIds?.length ||
+          ((await this.ffmpeg.isPlaylistFresh(dir)) &&
+            (await this.ffmpeg.isPlaylistAppendable(dir)));
+        await this.runEncode(slug, tz, profile, append, 'wall-clock', {
           skipCurrent: !!opts?.skipCurrent,
           completedEpisodeIds: opts?.completedEpisodeIds,
         });
@@ -464,25 +619,34 @@ export class StreamService implements OnModuleDestroy {
   private async ensureFinishFromJob(
     job: {
       episodeId?: number;
+      scheduleItemId?: number;
       offsetSec?: number;
       source?: string;
       mediaPath?: string;
       relativePath?: string;
       durationSec?: number;
+      startedAt?: number;
     },
     dir: string,
     date?: string,
   ): Promise<void> {
     if (await readAirFinish(dir)) return;
     if (!job.mediaPath || !job.episodeId || !job.durationSec) return;
+    const elapsed = Math.max(
+      0,
+      (Date.now() - (job.startedAt ?? Date.now())) / 1000,
+    );
     await writeAirFinish(dir, {
       date: date ?? calendarDateInTz('Europe/Tallinn'),
       episodeId: job.episodeId,
+      scheduleItemId: job.scheduleItemId,
       mediaPath: job.mediaPath,
       relativePath: job.relativePath ?? '',
-      inpointSec: job.offsetSec ?? 0,
-      durationSec: job.durationSec,
+      inpointSec: Math.floor((job.offsetSec ?? 0) + elapsed),
+      durationSec: Math.max(1, Math.floor(job.durationSec - elapsed)),
       source: job.source ?? 'regular',
+      policy: 'continuous',
+      generation: 1,
       savedAt: new Date().toISOString(),
     });
   }
@@ -504,7 +668,7 @@ export class StreamService implements OnModuleDestroy {
     let inpoint = finish.inpointSec;
     let duration = finish.durationSec;
 
-    // While Nest was down the frontend may have drained the buffer — advance inpoint.
+    // While Nest was down / idle the frontend may have drained the buffer — advance inpoint.
     const savedMs = Date.parse(finish.savedAt);
     if (Number.isFinite(savedMs)) {
       const idleSec = Math.max(0, Math.floor((Date.now() - savedMs) / 1000));
@@ -520,9 +684,10 @@ export class StreamService implements OnModuleDestroy {
         const airStart = windowStartAt(date, airWindowStart, tz);
         if (isWithinAirWindow(airStart, hours)) {
           this.logger.log(
-            `[${key}] air-finish elapsed during downtime → next episode`,
+            `[${key}] air-finish elapsed during downtime → next episode (sequential)`,
           );
           await clearAirFinish(dir);
+          // Sequential after this episode — not wall-clock (would skip owed slots).
           return this.runEncode(slug, tz, profile, false, 'wall-clock', {
             completedEpisodeIds: [finish.episodeId],
           });
@@ -535,10 +700,10 @@ export class StreamService implements OnModuleDestroy {
       }
     }
 
-    // Already at the ending — do not replay the credits.
-    if (duration < 90) {
+    // Tiny leftover only — finish credits if ≥20s; else sequential next.
+    if (duration < 20) {
       this.logger.log(
-        `[${key}] finish remaining ${duration}s — skip to next`,
+        `[${key}] finish remaining ${duration}s — skip to next (sequential)`,
       );
       await clearAirFinish(dir);
       return this.runEncode(slug, tz, profile, false, 'wall-clock', {
@@ -546,29 +711,8 @@ export class StreamService implements OnModuleDestroy {
       });
     }
 
-    try {
-      const airWindowStart = this.config.get<string>(
-        'AIR_WINDOW_START',
-        AIR_WINDOW_START,
-      );
-      const channel = await this.channels.findOne({ slug, isActive: true });
-      if (channel) {
-        const day = await this.loadScheduleDay(channel.id, tz);
-        const airStart = windowStartAt(date, airWindowStart, tz);
-        const rem = day
-          ? findRemainingPlaylist(day.scheduleItems, airStart)
-          : null;
-        if (
-          rem?.[0]?.item.episode?.id === finish.episodeId &&
-          rem[0].inpointSec > inpoint
-        ) {
-          inpoint = rem[0].inpointSec;
-          duration = rem[0].durationSec;
-        }
-      }
-    } catch {
-      /* keep saved */
-    }
+    // Do NOT catch up inpoint to wall-clock: if we were behind schedule, stay behind
+    // until this cartoon ends (otherwise idle → jump to the current grid slot).
 
     const remain = Math.max(1, duration);
     const updated: AirFinishState = {
@@ -576,6 +720,8 @@ export class StreamService implements OnModuleDestroy {
       date: finish.date || date,
       inpointSec: inpoint,
       durationSec: remain,
+      policy: finish.policy ?? 'continuous',
+      generation: finish.generation ?? 1,
     };
     await writeAirFinish(dir, updated);
 
@@ -609,24 +755,33 @@ export class StreamService implements OnModuleDestroy {
       streamRoot,
       folderName,
       segments,
-      // Resume also uses append if the playlist is live — otherwise a seam hole.
-      append: true,
+      append,
       rollingHandoff: false,
       onNaturalEnd: ({ rolling }) => {
+        if (rolling) {
+          void this.continueEncode(slug, tz, profile, { resumeCursor: true });
+          return;
+        }
         void this.continueEncode(slug, tz, profile, {
-          completedEpisodeIds: rolling ? undefined : [finish.episodeId],
+          completedEpisodeIds: [finish.episodeId],
         });
       },
       onStallEnd: () => {
         const elapsed = (Date.now() - encodeStartedAt) / 1000;
-        if (elapsed < 45) {
+        // Short finish tails: solo-seam kills ffmpeg before 45s — "retry" loops the ending.
+        const shortTail = remainingAtStart <= 90;
+        const left = Math.max(0, remainingAtStart - elapsed);
+        const nearEof = left <= 90;
+        // Near EOF hang — advance/off-air, do not resumeCursor the credits.
+        if (elapsed < 45 && !shortTail && !nearEof) {
           this.logger.warn(
             `[${key}] finish stall during seek (${Math.round(elapsed)}s) — retry`,
           );
-          void this.continueEncode(slug, tz, profile);
+          void this.continueEncode(slug, tz, profile, { resumeCursor: true });
           return;
         }
-        const nearEnd = elapsed >= Math.max(0, remainingAtStart - 60);
+        const nearEnd =
+          shortTail || nearEof || elapsed >= Math.max(0, remainingAtStart - 60);
         void this.continueEncode(slug, tz, profile, {
           skipCurrent: nearEnd,
           completedEpisodeIds: nearEnd ? [finish.episodeId] : undefined,
@@ -635,6 +790,7 @@ export class StreamService implements OnModuleDestroy {
     });
 
     job.episodeId = finish.episodeId;
+    job.scheduleItemId = finish.scheduleItemId;
     job.offsetSec = updated.inpointSec;
     job.source = finish.source;
     job.remainingCount = 1;
@@ -695,37 +851,66 @@ export class StreamService implements OnModuleDestroy {
       return this.runFinishEncode(slug, tz, profile, finishPending, append);
     }
 
-    let all = findRemainingPlaylist(items, airStart);
-    this.businessValidation.assertNotEmpty(all, 'Channel is off air');
+    let all = findRemainingPlaylist(items, airStart) ?? [];
 
-    // File already finished but the grid still points at it (DB duration > file) —
-    // otherwise the ending loops 2–3 times.
-    if (opts?.completedEpisodeIds?.length) {
-      const done = new Set(opts.completedEpisodeIds);
-      let dropped = 0;
-      while (all.length && done.has(all[0].item.episode?.id ?? -1)) {
-        all = all.slice(1);
-        dropped += 1;
-      }
-      if (dropped) {
+    // Continuous seam (finished/skipped): next grid row, NOT wall-clock.
+    // Ending-loop delay used to jump Transformers → Flapjack and skip Bakugan.
+    let usedSequential = false;
+    const completedIds = opts?.completedEpisodeIds ?? [];
+    const seamIds =
+      completedIds.length > 0
+        ? completedIds
+        : opts?.skipCurrent && finishPending
+          ? [finishPending.episodeId]
+          : [];
+    if (seamIds.length) {
+      const seq = findPlaylistAfterCompleted(
+        items,
+        seamIds,
+        finishPending?.scheduleItemId,
+      );
+      if (seq?.length) {
         this.logger.log(
-          `[${slug}] advance past ${dropped} completed episode(s) → next`,
+          `[${slug}] sequential after ep=${seamIds.join(',')} → next=${seq[0].item.episode?.id ?? seq[0].item.episodeId} (${seq.length} left)`,
         );
-      }
-      if (all.length) {
-        all = all.map((s, i) =>
-          i === 0
-            ? {
-                item: s.item,
-                inpointSec: 0,
-                durationSec: s.item.durationSec,
-              }
-            : s,
-        );
+        all = seq;
+        usedSequential = true;
+      } else if (completedIds.length) {
+        const done = new Set(completedIds);
+        let dropped = 0;
+        while (
+          all.length &&
+          done.has(all[0].item.episode?.id ?? all[0].item.episodeId ?? -1)
+        ) {
+          all = all.slice(1);
+          dropped += 1;
+        }
+        if (dropped) {
+          this.logger.log(
+            `[${slug}] advance past ${dropped} completed episode(s) → next`,
+          );
+        }
+        if (all.length) {
+          all = all.map((s, i) =>
+            i === 0
+              ? {
+                  item: s.item,
+                  inpointSec: 0,
+                  durationSec: s.item.durationSec,
+                }
+              : s,
+          );
+        } else {
+          // Last schedule row done — nothing left on wall-clock either.
+          this.businessValidation.assert(false, 'Channel is off air');
+        }
+      } else if (!seq?.length && seamIds.length && !completedIds.length) {
+        // skipCurrent on last row (no completed ids yet)
+        this.businessValidation.assert(false, 'Channel is off air');
       }
     }
 
-    if (opts?.skipCurrent && all.length > 1) {
+    if (!usedSequential && opts?.skipCurrent && all.length > 1) {
       this.logger.warn(`[${slug}] stall skip current episode → next`);
       all = all.slice(1).map((s, i) =>
         i === 0
@@ -736,14 +921,18 @@ export class StreamService implements OnModuleDestroy {
             }
           : s,
       );
-    } else if (opts?.skipCurrent) {
+    } else if (!usedSequential && opts?.skipCurrent && all.length <= 1) {
       this.businessValidation.assert(false, 'Channel is off air');
     }
 
+    this.businessValidation.assertNotEmpty(all, 'Channel is off air');
+
     // Tail < 90s — do not encode the ending (hang + append mash). Go to the next one.
+    // Skip on sequential seams: we already chose the next full episode on purpose.
     const tailSkipSec = Number(this.config.get('STREAM_TAIL_SKIP_SEC', 90));
     let droppedTail = false;
     while (
+      !usedSequential &&
       all.length > 1 &&
       all[0].inpointSec > 0 &&
       all[0].durationSec < Math.max(15, tailSkipSec)
@@ -838,15 +1027,19 @@ export class StreamService implements OnModuleDestroy {
     const remainingAtStart = first.durationSec;
     const encodeStartedAt = Date.now();
 
-    // Air cursor: always write — after Nest restart we do not roll back to wall-clock.
+    // Air cursor: always write — continuous debt until this cartoon ends.
+    const prevCursor = await readAirFinish(dir);
     await writeAirFinish(dir, {
       date,
       episodeId: firstEp.id,
+      scheduleItemId: first.item.id,
       mediaPath: firstPath,
       relativePath: firstEp.relativePath,
       inpointSec: first.inpointSec,
       durationSec: first.durationSec,
       source: first.item.source ?? 'regular',
+      policy: 'continuous',
+      generation: prevCursor?.generation ?? 1,
       savedAt: new Date().toISOString(),
     });
 
@@ -859,26 +1052,42 @@ export class StreamService implements OnModuleDestroy {
       append: doAppend,
       rollingHandoff: useLookahead && !midEpisode,
       onNaturalEnd: ({ rolling }) => {
+        if (rolling) {
+          // Crash / early handoff — resume same cartoon, do not wall-clock skip.
+          void this.continueEncode(slug, tz, profile, { resumeCursor: true });
+          return;
+        }
         void this.continueEncode(slug, tz, profile, {
-          // Single-episode window finished → always mark completed.
-          completedEpisodeIds: rolling
-            ? undefined
-            : encodedEpisodeIds,
+          completedEpisodeIds: encodedEpisodeIds,
         });
       },
       onStallEnd: () => {
         const elapsed = (Date.now() - encodeStartedAt) / 1000;
-        if (elapsed < 45) {
+        // Solo/fastSeek: stall after seek ≈ EOF/credits (file shorter than the grid).
+        const solo = hlsSegments.length === 1;
+        // Episode ending (<~90s left): seam timer often fires at 12–40s.
+        // Old "elapsed < 45 → retry" re-encoded the credits in a loop (Prime→Prime→…).
+        const shortTail = remainingAtStart <= 90;
+        const left = Math.max(0, remainingAtStart - elapsed);
+        const nearEof = left <= 90 || (solo && elapsed >= 12);
+        // Startup seek only — not EOF hang on last/credits (that replayed the ending).
+        if (elapsed < 45 && !shortTail && !nearEof) {
           this.logger.warn(
             `[${slug}] stall during startup/seek (${Math.round(elapsed)}s) — retry same`,
           );
-          void this.continueEncode(slug, tz, profile);
+          void this.continueEncode(slug, tz, profile, { resumeCursor: true });
           return;
         }
-        // Solo/fastSeek: stall after seek ≈ EOF/credits (file shorter than the grid).
-        const solo = hlsSegments.length === 1;
         const nearEnd =
-          solo || elapsed >= Math.max(0, remainingAtStart - 60);
+          shortTail ||
+          nearEof ||
+          solo ||
+          elapsed >= Math.max(0, remainingAtStart - 60);
+        if ((shortTail || nearEof) && elapsed < 45) {
+          this.logger.warn(
+            `[${slug}] short-tail/EOF stall (${Math.round(elapsed)}s / ${Math.round(left)}s left) — advance`,
+          );
+        }
         void this.continueEncode(slug, tz, profile, {
           skipCurrent: nearEnd,
           completedEpisodeIds:
@@ -888,6 +1097,7 @@ export class StreamService implements OnModuleDestroy {
     });
 
     job.episodeId = firstEp.id;
+    job.scheduleItemId = first.item.id;
     job.offsetSec = first.inpointSec;
     job.source = first.item.source;
     job.remainingCount = all.length;
@@ -943,14 +1153,15 @@ export class StreamService implements OnModuleDestroy {
     }
     const ageMs = hasPlaylist ? await this.ffmpeg.segmentAgeMs(dir) : null;
     const alive = !!(job && this.ffmpeg.isJobAlive(job));
+    // Keep idle TTL alive while the client polls /status during cold seek.
+    if (alive) this.ffmpeg.touch(key);
+    // Never report live from orphan playlist alone — wiped encode leaves fresh .ts briefly.
     let ready =
-      !!job?.ready ||
-      (alive && ageMs != null && ageMs < 30_000) ||
-      (!!hasPlaylist && ageMs != null && ageMs < 15_000);
+      !!job?.ready || (alive && ageMs != null && ageMs < 30_000);
 
     if (job && ready && !job.ready) job.ready = true;
 
-    if (ready) {
+    if (ready && alive) {
       return {
         channel: slug,
         key,
