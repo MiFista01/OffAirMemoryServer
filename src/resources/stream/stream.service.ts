@@ -30,6 +30,7 @@ import {
 import { access } from 'fs/promises';
 import { join } from 'path';
 import { AirHistoryService } from '../air-history/air-history.service';
+import { getVideoDurationSec } from '../channels/scan/video-duration';
 
 type HlsSegmentInput = {
   path: string;
@@ -322,6 +323,55 @@ export class StreamService implements OnModuleDestroy {
     }
   }
 
+  /**
+   * Grid duration can exceed real file length (bad scan / bad inpoint).
+   * Clamp ffmpeg window so solo -ss/-t does not EOF instantly (CN Johnny Bravo etc.).
+   */
+  private async clampSegmentsToFile(
+    segments: HlsSegmentInput[],
+    episodeId?: number,
+  ): Promise<{
+    segments: HlsSegmentInput[];
+    skipEpisodeId?: number;
+    path?: string;
+  }> {
+    if (!segments.length) return { segments };
+    const head = segments[0];
+    const fileDur = await getVideoDurationSec(head.path);
+    if (fileDur == null || fileDur <= 0) return { segments };
+
+    const inpoint = Math.min(
+      Math.max(0, head.inpointSec),
+      Math.max(0, fileDur - 0.5),
+    );
+    const available = fileDur - inpoint;
+    if (available <= 0.75) {
+      return {
+        segments,
+        skipEpisodeId: episodeId,
+        path: head.path,
+      };
+    }
+
+    const duration = Math.min(
+      head.durationSec,
+      Math.max(1, available - 0.5),
+    );
+    if (
+      Math.abs(duration - head.durationSec) > 1.5 ||
+      Math.abs(inpoint - head.inpointSec) > 0.5
+    ) {
+      this.logger.warn(
+        `[stream] clamp ${head.path}: in ${head.inpointSec}s→${inpoint}s, ` +
+          `dur ${head.durationSec}s→${duration}s (file ${fileDur.toFixed(1)}s)`,
+      );
+    }
+
+    const out = [...segments];
+    out[0] = { ...head, inpointSec: inpoint, durationSec: duration };
+    return { segments: out };
+  }
+
   private airTimeHours(): number {
     const hours = Number(
       this.config.get<string | number>('AIR_TIME_HOURS', AIR_TIME_HOURS),
@@ -529,13 +579,28 @@ export class StreamService implements OnModuleDestroy {
     };
     await writeAirFinish(dir, updated);
 
-    const segments: HlsSegmentInput[] = [
+    let segments: HlsSegmentInput[] = [
       {
         path: finish.mediaPath,
         inpointSec: updated.inpointSec,
         durationSec: updated.durationSec,
       },
     ];
+    const finishClamp = await this.clampSegmentsToFile(
+      segments,
+      finish.episodeId,
+    );
+    if (finishClamp.skipEpisodeId) {
+      await clearAirFinish(dir);
+      return this.runEncode(slug, tz, profile, false, 'wall-clock', {
+        completedEpisodeIds: [finish.episodeId],
+      });
+    }
+    segments = finishClamp.segments;
+    updated.inpointSec = segments[0].inpointSec;
+    updated.durationSec = segments[0].durationSec;
+    await writeAirFinish(dir, updated);
+
     const encodeStartedAt = Date.now();
     const remainingAtStart = updated.durationSec;
 
@@ -736,7 +801,7 @@ export class StreamService implements OnModuleDestroy {
     // Ending mash is fixed via completedEpisodeIds, not by wiping the folder.
     const doAppend = append;
 
-    const hlsSegments: HlsSegmentInput[] = segments.map((seg) => {
+    let hlsSegments: HlsSegmentInput[] = segments.map((seg) => {
       const ep = seg.item.episode;
       this.businessValidation.assertExists(ep, 'Episode file missing');
       return {
@@ -745,6 +810,24 @@ export class StreamService implements OnModuleDestroy {
         durationSec: seg.durationSec,
       };
     });
+
+    const firstEpForClamp = segments[0].item.episode!;
+    const clamped = await this.clampSegmentsToFile(
+      hlsSegments,
+      firstEpForClamp.id,
+    );
+    if (clamped.skipEpisodeId) {
+      this.logger.warn(
+        `[${slug}] seek past file end (${clamped.path}) — skip to next slot`,
+      );
+      return this.runEncode(slug, tz, profile, false, 'wall-clock', {
+        skipCurrent: true,
+        completedEpisodeIds: [clamped.skipEpisodeId],
+      });
+    }
+    hlsSegments = clamped.segments;
+    segments[0].inpointSec = hlsSegments[0].inpointSec;
+    segments[0].durationSec = hlsSegments[0].durationSec;
 
     const first = segments[0];
     const firstEp = first.item.episode;
