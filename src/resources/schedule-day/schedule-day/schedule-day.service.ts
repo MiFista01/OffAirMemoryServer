@@ -9,10 +9,34 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ChannelsService } from 'src/resources/channels/channels/channels.service';
 import { CartoonService } from 'src/resources/channels/cartoon/cartoon.service';
-import { AIR_TIME_HOURS } from '@constants';
+import { AIR_TIME_HOURS, AIR_WINDOW_START } from '@constants';
 import { ScheduleItemService } from '../schedule-item/schedule-item.service';
 import { buildDayPlaylist, todayUtcDate } from './schedule-day.builder';
 import { AirHistoryService } from 'src/resources/air-history/air-history.service';
+import {
+  calendarDateInTz,
+  windowStartAt,
+} from 'src/resources/stream/stream-air.util';
+
+export type GuideSlotDto = {
+  order: number;
+  episodeId: number;
+  durationSec: number;
+  startAt: string;
+  endAt: string;
+  title: string;
+  seasonNumber: number;
+  episodeNumber: number;
+  cartoonSlug: string | null;
+  source: string;
+};
+
+export type GuideChannelDto = {
+  id: number;
+  slug: string;
+  name: string;
+  slots: GuideSlotDto[];
+};
 
 @Injectable()
 export class ScheduleDayService
@@ -42,6 +66,85 @@ export class ScheduleDayService
       this.config.get<string | number>('AIR_TIME_HOURS', AIR_TIME_HOURS),
     );
     return (Number.isFinite(hours) ? hours : AIR_TIME_HOURS) * 60 * 60;
+  }
+
+  private airWindowStart(): string {
+    return this.config.get<string>('AIR_WINDOW_START', AIR_WINDOW_START);
+  }
+
+  /**
+   * EPG payload: all active channels + timed slots for the local air day.
+   * Times are absolute ISO so the client can draw the "now" line without tz math.
+   */
+  async getTodayGuide(tz = 'Europe/Tallinn') {
+    const airWindowStart = this.airWindowStart();
+    const airTimeHours = this.airTimeSec() / 3600;
+    const localDate = calendarDateInTz(tz);
+    const utcDate = todayUtcDate();
+    const airStart = windowStartAt(localDate, airWindowStart, tz);
+    const channels = await this.channelService.findAllBySearch({
+      isActive: true,
+    });
+
+    const out: GuideChannelDto[] = [];
+    for (const channel of channels) {
+      let day = await this.findOne(
+        { date: localDate, channelId: channel.id },
+        [
+          'scheduleItems',
+          'scheduleItems.episode',
+          'scheduleItems.episode.cartoon',
+        ],
+      );
+      if (!day && utcDate !== localDate) {
+        day = await this.findOne(
+          { date: utcDate, channelId: channel.id },
+          [
+            'scheduleItems',
+            'scheduleItems.episode',
+            'scheduleItems.episode.cartoon',
+          ],
+        );
+      }
+      const raw = [...(day?.scheduleItems ?? [])].sort(
+        (a, b) => a.order - b.order,
+      );
+      let cursor = airStart.getTime();
+      const slots: GuideSlotDto[] = raw.map((item) => {
+        const startMs = cursor;
+        const endMs = cursor + Math.max(1, item.durationSec) * 1000;
+        cursor = endMs;
+        const ep = item.episode;
+        const cartoon = ep?.cartoon;
+        return {
+          order: item.order,
+          episodeId: item.episodeId,
+          durationSec: item.durationSec,
+          startAt: new Date(startMs).toISOString(),
+          endAt: new Date(endMs).toISOString(),
+          title: cartoon?.name ?? ep?.title ?? ep?.relativePath ?? '—',
+          seasonNumber: ep?.seasonNumber ?? 0,
+          episodeNumber: ep?.episodeNumber ?? 0,
+          cartoonSlug: cartoon?.slug ?? null,
+          source: item.source ?? 'regular',
+        };
+      });
+      out.push({
+        id: channel.id,
+        slug: channel.slug,
+        name: channel.name,
+        slots,
+      });
+    }
+
+    return {
+      date: localDate,
+      tz,
+      airWindowStart,
+      airTimeHours,
+      airStartAt: airStart.toISOString(),
+      channels: out,
+    };
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_1AM)

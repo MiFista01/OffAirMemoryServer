@@ -1,4 +1,4 @@
-import { Controller, Get, Post } from '@nestjs/common';
+import { Controller, Get, Post, Query } from '@nestjs/common';
 import { ScheduleDayService } from './schedule-day.service';
 import { ParamDto, Public } from '@decorators';
 import { ParamsNumbDto, ParamsSlugDto } from '@dtos';
@@ -28,6 +28,15 @@ export class ScheduleDayController {
     return this.scheduleDayService.createDaySchedule();
   }
 
+  /** TV guide / EPG: all channels + timed slots for the air day. */
+  @Public()
+  @Get('guide/today')
+  guideToday(@Query('tz') tz?: string) {
+    return this.scheduleDayService.getTodayGuide(
+      tz?.trim() || 'Europe/Tallinn',
+    );
+  }
+
   @Public()
   @Get('channel/:channelId')
   findByChannelId(
@@ -35,7 +44,11 @@ export class ScheduleDayController {
   ) {
     return this.scheduleDayService.findAllBySearch(
       { date: todayUtcDate(), channelId },
-      ['scheduleItems', 'scheduleItems.episode'],
+      [
+        'scheduleItems',
+        'scheduleItems.episode',
+        'scheduleItems.episode.cartoon',
+      ],
     );
   }
 
@@ -46,7 +59,11 @@ export class ScheduleDayController {
     this.businessValidation.assertExists(channel, 'Channel not found');
     return this.scheduleDayService.findAllBySearch(
       { date: todayUtcDate(), channelId: channel.id },
-      ['scheduleItems', 'scheduleItems.episode'],
+      [
+        'scheduleItems',
+        'scheduleItems.episode',
+        'scheduleItems.episode.cartoon',
+      ],
     );
   }
 
