@@ -4,6 +4,31 @@ import { ChildProcessWithoutNullStreams } from 'child_process';
 import { access, readdir, readFile, rm, stat } from 'fs/promises';
 import { join } from 'path';
 
+/** Windows: ffmpeg often still holds concat.txt/.ts after SIGTERM → EBUSY. */
+async function safeRm(
+  logger: Logger | undefined,
+  path: string,
+  tries = 6,
+): Promise<void> {
+  for (let i = 0; i < tries; i++) {
+    try {
+      await rm(path, { force: true });
+      return;
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      const busy =
+        err?.code === 'EBUSY' ||
+        err?.code === 'EPERM' ||
+        err?.code === 'EACCES';
+      if (!busy || i === tries - 1) {
+        logger?.warn(`[hls] rm failed ${path}: ${err?.code ?? err}`);
+        return;
+      }
+      await new Promise((r) => setTimeout(r, 80 + i * 120));
+    }
+  }
+}
+
 export async function newestSegmentAgeMs(dir: string): Promise<number | null> {
     try {
       const names = await readdir(dir);
@@ -103,44 +128,44 @@ export async function isPlaylistAppendable(
     return true;
   }
 
-/** Full HLS wipe after end of air: .ts + .m3u8 + concat. */
+/** Full HLS wipe after end of air: .ts + .m3u8 + concat. Never throws (Windows EBUSY). */
 export async function clearHlsFolder(
   logger: Logger,
   dir: string,
 ): Promise<void> {
-    let names: string[] = [];
-    try {
-      names = await readdir(dir);
-    } catch {
-      return;
-    }
-    await Promise.all(
-      names
-        .filter(
-          (n) =>
-            n.endsWith('.ts') ||
-            n.endsWith('.m3u8') ||
-            n === 'concat.txt',
-        )
-        .map((n) => rm(join(dir, n), { force: true })),
-    );
-    logger.log(`[hls] cleared folder ${dir}`);
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
   }
+  await Promise.all(
+    names
+      .filter(
+        (n) =>
+          n.endsWith('.ts') ||
+          n.endsWith('.m3u8') ||
+          n === 'concat.txt',
+      )
+      .map((n) => safeRm(logger, join(dir, n))),
+  );
+  logger.log(`[hls] cleared folder ${dir}`);
+}
 
 export async function clearHlsArtifacts(dir: string): Promise<void> {
-    let names: string[] = [];
-    try {
-      names = await readdir(dir);
-    } catch {
-      return;
-    }
-    // Leave playlist.m3u8 alone — otherwise hls.js hits 404 while ffmpeg writes a new one.
-    await Promise.all(
-      names
-        .filter((n) => n.endsWith('.ts'))
-        .map((n) => rm(join(dir, n), { force: true })),
-    );
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
   }
+  // Leave playlist.m3u8 alone — otherwise hls.js hits 404 while ffmpeg writes a new one.
+  await Promise.all(
+    names
+      .filter((n) => n.endsWith('.ts'))
+      .map((n) => safeRm(undefined, join(dir, n))),
+  );
+}
 
 /**
  * Deletes playlist*.ts files that are not in the current m3u8.
@@ -186,7 +211,7 @@ export async function sweepOrphanSegments(
         try {
           const st = await stat(full);
           if (now - st.mtimeMs < freshMs) return;
-          await rm(full, { force: true });
+          await safeRm(logger, full);
           removed += 1;
         } catch {
           /* ignore */

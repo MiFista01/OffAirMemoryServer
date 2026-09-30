@@ -3,7 +3,7 @@ import { STREAM_URL_PREFIX } from '@constants';
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { spawn } from 'child_process';
-import { access, chmod, mkdir, writeFile } from 'fs/promises';
+import { access, chmod, mkdir } from 'fs/promises';
 import { join } from 'path';
 import {
   buildHlsArgs,
@@ -33,6 +33,9 @@ export type FfmpegStartHost = {
   enqueueClear(key: string, dir: string): Promise<void>;
   clearHandoffTimer(key: string): void;
   persistJobCursor(job: FfmpegJob, bumpGeneration?: boolean): Promise<void>;
+  markPreparing(folderName: string): void;
+  clearPreparing(folderName: string): void;
+  writeFileRetry(path: string, body: string): Promise<void>;
 };
 
 export async function startHlsUnlocked(
@@ -97,67 +100,81 @@ export async function startHlsUnlocked(
       append = false;
     }
 
-    // Fresh: remove old m3u8/.ts, otherwise the player briefly eats the previous live-edge.
-    // Append (episode seam in the same air window) — leave alone, or a gap until the first .ts.
-    if (!append) {
-      await host.enqueueClear(opts.key, dir);
-    }
-
-    const startNumber = append ? await nextStartNumber(dir) : 0;
-
-    const firstSeg = opts.segments[0];
-    // Single file + mid-seek → -ss before -i (much faster than concat inpoint on X:/NAS).
-    const useFastSeek =
-      opts.segments.length === 1 && (firstSeg?.inpointSec ?? 0) > 2;
-
-    let listPath = '';
-    if (!useFastSeek) {
-      listPath = join(dir, 'concat.txt');
-      const lines = ['ffconcat version 1.0'];
-      for (const s of opts.segments) {
-        const file = s.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
-        const inpoint = Math.max(0, s.inpointSec);
-        const outpoint = inpoint + Math.max(1, s.durationSec) - 1.25;
-        lines.push(`file '${file}'`);
-        if (inpoint > 0) lines.push(`inpoint ${inpoint}`);
-        lines.push(`outpoint ${outpoint}`);
-      }
-      await writeFile(listPath, lines.join('\n'), 'utf8');
-    }
-
-    const ffmpegBin = host.config.get<string>('FFMPEG_PATH', 'ffmpeg');
-    const args = useFastSeek
-      ? buildHlsArgsFastSeek(host.config, 
-          firstSeg.path,
-          firstSeg.inpointSec,
-          firstSeg.durationSec,
-          playlist,
-          append,
-          startNumber,
-        )
-      : buildHlsArgs(host.config, listPath, playlist, append, startNumber);
-
-    host.logger.log(
-      `[${opts.key}] segs=${opts.segments.length} append=${append} start=${startNumber}` +
-        `${useFastSeek ? ' fastSeek' : ''} hw=${hwMode(host.config)}`,
-    );
+    // Kill previous ffmpeg FIRST — otherwise Windows EBUSY on concat.txt/.ts wipe.
     host.stop(opts.key);
-    host.stopped.delete(opts.key);
-    const child = spawn(ffmpegBin, args, { windowsHide: true });
+    host.markPreparing(opts.folderName);
+    let child: ReturnType<typeof spawn>;
+    let startNumber: number;
+    let firstSeg: (typeof opts.segments)[0];
+    let useFastSeek: boolean;
+    try {
+      if (!append) {
+        await new Promise((r) => setTimeout(r, 200));
+        await host.enqueueClear(opts.key, dir);
+      }
+
+      startNumber = append ? await nextStartNumber(dir) : 0;
+
+      firstSeg = opts.segments[0];
+      // Single file + mid-seek → -ss before -i (much faster than concat inpoint on X:/NAS).
+      useFastSeek =
+        opts.segments.length === 1 && (firstSeg?.inpointSec ?? 0) > 2;
+
+      let listPath = '';
+      if (!useFastSeek) {
+        listPath = join(dir, 'concat.txt');
+        const lines = ['ffconcat version 1.0'];
+        for (const s of opts.segments) {
+          const file = s.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
+          const inpoint = Math.max(0, s.inpointSec);
+          const outpoint = inpoint + Math.max(1, s.durationSec) - 1.25;
+          lines.push(`file '${file}'`);
+          if (inpoint > 0) lines.push(`inpoint ${inpoint}`);
+          lines.push(`outpoint ${outpoint}`);
+        }
+        await host.writeFileRetry(listPath, lines.join('\n'));
+      }
+
+      const ffmpegBin = host.config.get<string>('FFMPEG_PATH', 'ffmpeg');
+      const args = useFastSeek
+        ? buildHlsArgsFastSeek(
+            host.config,
+            firstSeg.path,
+            firstSeg.inpointSec,
+            firstSeg.durationSec,
+            playlist,
+            append,
+            startNumber,
+          )
+        : buildHlsArgs(host.config, listPath, playlist, append, startNumber);
+
+      host.logger.log(
+        `[${opts.key}] segs=${opts.segments.length} append=${append} start=${startNumber}` +
+          `${useFastSeek ? ' fastSeek' : ''} hw=${hwMode(host.config)}`,
+      );
+      host.stopped.delete(opts.key);
+      child = spawn(ffmpegBin, args, { windowsHide: true });
+    } catch (e) {
+      host.clearPreparing(opts.folderName);
+      throw e;
+    }
     child.stderr.on('data', (buf) =>
       host.logger.warn(`[${opts.key}] ${buf.toString().trim()}`),
     );
     child.on('error', (err) => {
       host.logger.error(`[${opts.key}] spawn failed: ${err.message}`);
       host.jobs.delete(opts.key);
+      host.clearPreparing(opts.folderName);
     });
     child.on('exit', (code, signal) => {
       const current = host.jobs.get(opts.key);
-      if (current && current.process !== child) return;
+      // Late exit after stop()/superseded spawn — do NOT continueEncode (ending loops).
+      if (!current || current.process !== child) return;
 
       host.clearHandoffTimer(opts.key);
+      host.clearPreparing(opts.folderName);
       host.logger.log(`[${opts.key}] ffmpeg exit code=${code} signal=${signal}`);
-      const deadJob = current ?? undefined;
+      const deadJob = current;
       host.jobs.delete(opts.key);
       const rolling = host.rollingHandoff.delete(opts.key);
       const fromStall = host.stallSkip.delete(opts.key);
@@ -180,12 +197,10 @@ export async function startHlsUnlocked(
         `[${opts.key}] ffmpeg died unexpectedly code=${code} signal=${signal} — resume cursor`,
       );
       void (async () => {
-        if (deadJob) {
-          try {
-            await host.persistJobCursor(deadJob, true);
-          } catch (e) {
-            host.logger.warn(`[${opts.key}] crash cursor save failed: ${e}`);
-          }
+        try {
+          await host.persistJobCursor(deadJob, true);
+        } catch (e) {
+          host.logger.warn(`[${opts.key}] crash cursor save failed: ${e}`);
         }
         await Promise.resolve(opts.onNaturalEnd!({ rolling: true }));
       })().catch((e) =>
@@ -263,6 +278,7 @@ export async function startHlsUnlocked(
     try {
       await waitForPlaylist(playlist, child, initialWait, startNumber);
       job.ready = true;
+      host.clearPreparing(opts.folderName);
       void sweepOrphanSegments(host.logger, dir).catch((e) =>
         host.logger.warn(`[${opts.key}] orphan sweep failed: ${e}`),
       );
@@ -281,6 +297,7 @@ export async function startHlsUnlocked(
         const cur = host.jobs.get(opts.key);
         if (cur && cur.process === child) {
           cur.ready = true;
+          host.clearPreparing(opts.folderName);
           host.logger.log(`[${opts.key}] HLS ready (deferred)`);
         }
         void sweepOrphanSegments(host.logger, dir).catch(() => undefined);
@@ -297,6 +314,7 @@ export async function startHlsUnlocked(
         }
         host.jobs.delete(opts.key);
         host.clearHandoffTimer(opts.key);
+        host.clearPreparing(opts.folderName);
         if (append && !opts._freshRetry) {
           host.logger.warn(`[${opts.key}] retry fresh HLS after deferred fail`);
           try {

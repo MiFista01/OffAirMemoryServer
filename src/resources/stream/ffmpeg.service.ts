@@ -32,8 +32,39 @@ export class FfmpegService implements OnModuleDestroy {
 
   /** Serialize folder wipes so /start cannot spawn into a half-deleted HLS dir. */
   private readonly clearLocks = new Map<string, Promise<void>>();
+  /**
+   * Folder names mid stop→clear→spawn (no job.ready yet).
+   * Static /stream must 503 here — bare 404 makes the client reboot-storm.
+   */
+  private readonly preparingFolders = new Set<string>();
 
   constructor(private readonly config: ConfigService) {}
+
+  markPreparing(folderName: string): void {
+    if (folderName) this.preparingFolders.add(folderName);
+  }
+
+  clearPreparing(folderName: string): void {
+    if (folderName) this.preparingFolders.delete(folderName);
+  }
+
+  async writeFileRetry(path: string, body: string): Promise<void> {
+    const { writeFile } = await import('fs/promises');
+    for (let i = 0; i < 6; i++) {
+      try {
+        await writeFile(path, body, 'utf8');
+        return;
+      } catch (e) {
+        const err = e as NodeJS.ErrnoException;
+        const busy =
+          err?.code === 'EBUSY' ||
+          err?.code === 'EPERM' ||
+          err?.code === 'EACCES';
+        if (!busy || i === 5) throw e;
+        await new Promise((r) => setTimeout(r, 80 + i * 120));
+      }
+    }
+  }
 
   /** Wait for any in-flight wipe on this key (call before writing new HLS). */
   async waitForClear(key: string): Promise<void> {
@@ -46,7 +77,12 @@ export class FfmpegService implements OnModuleDestroy {
     const run = prev
       .catch(() => undefined)
       .then(async () => {
-        await this.clearHlsFolder(dir);
+        try {
+          await this.clearHlsFolder(dir);
+        } catch (e) {
+          // Must never reject — unhandled EBUSY used to kill the whole Nest process.
+          this.logger.warn(`[${key}] HLS clear failed: ${e}`);
+        }
       });
     this.clearLocks.set(
       key,
@@ -88,6 +124,7 @@ export class FfmpegService implements OnModuleDestroy {
    */
   isFolderPreparing(folderName: string): boolean {
     if (!folderName) return false;
+    if (this.preparingFolders.has(folderName)) return true;
     for (const job of this.jobs.values()) {
       if (!this.isAlive(job) || job.ready) continue;
       if (
@@ -193,7 +230,7 @@ export class FfmpegService implements OnModuleDestroy {
     if (!job) return false;
     job.process.kill('SIGTERM');
     this.jobs.delete(key);
-    void sweepOrphanSegments(this.logger, job.dir).catch(() => undefined);
+    // Do NOT sweep orphans here — races with append restart writing new .ts.
     return true;
   }
 
@@ -216,10 +253,15 @@ export class FfmpegService implements OnModuleDestroy {
   async stopAndClear(key: string): Promise<boolean> {
     const job = this.jobs.get(key);
     const dir = job?.dir;
+    const folder = dir?.replace(/\\/g, '/').split('/').pop();
+    if (folder) this.markPreparing(folder);
     const stopped = this.stop(key);
     if (dir) {
+      // Let Windows release concat.txt handles before unlink.
+      await new Promise((r) => setTimeout(r, 200));
       await this.enqueueClear(key, dir);
     }
+    if (folder) this.clearPreparing(folder);
     return stopped;
   }
 
@@ -254,6 +296,7 @@ export class FfmpegService implements OnModuleDestroy {
         }
         this.stop(key);
         try {
+          await new Promise((r) => setTimeout(r, 200));
           await this.enqueueClear(key, dir);
         } catch (e) {
           this.logger.warn(`[${key}] idle HLS clear failed: ${e}`);
