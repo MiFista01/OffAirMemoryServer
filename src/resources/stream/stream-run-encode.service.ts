@@ -13,6 +13,7 @@ import {
   findPlaylistAfterCompleted,
   findRemainingPlaylist,
   isFinishingOverrun,
+  isSequentialBehindWallClock,
   isWithinAirWindow,
   streamFolderName,
   trimPlaylistToAirEnd,
@@ -104,12 +105,25 @@ export class StreamRunEncodeService {
         seamIds,
         finishPending?.scheduleItemId,
       );
+      const wall = findRemainingPlaylist(items, airStart) ?? [];
       if (seq?.length) {
-        this.logger.log(
-          `[${slug}] sequential after ep=${seamIds.join(',')} → next=${seq[0].item.episode?.id ?? seq[0].item.episodeId} (${seq.length} left)`,
-        );
-        all = seq;
-        usedSequential = true;
+        // Owed next row already finished on the grid → jump to what's on air now.
+        // Keeps Bakugan when still inside its slot; drops JL restart when TD has started.
+        if (isSequentialBehindWallClock(seq, wall) && wall.length) {
+          this.logger.log(
+            `[${slug}] sequential behind wall-clock ` +
+              `(owed ep=${seq[0].item.episode?.id ?? seq[0].item.episodeId} → ` +
+              `now ep=${wall[0].item.episode?.id ?? wall[0].item.episodeId}) — catch up`,
+          );
+          all = wall;
+          usedSequential = false;
+        } else {
+          this.logger.log(
+            `[${slug}] sequential after ep=${seamIds.join(',')} → next=${seq[0].item.episode?.id ?? seq[0].item.episodeId} (${seq.length} left)`,
+          );
+          all = seq;
+          usedSequential = true;
+        }
       } else if (completedIds.length) {
         const done = new Set(completedIds);
         let dropped = 0;

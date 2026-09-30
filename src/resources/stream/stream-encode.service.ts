@@ -179,6 +179,23 @@ export class StreamEncodeService {
       const finish = await readAirFinish(dir);
 
       if (opts?.resumeCursor && finish) {
+        // Credits / short leftover — never re-encode the ending (loops JL credits → restart).
+        if (finish.durationSec <= 120) {
+          this.logger.warn(
+            `[${key}] resume cursor on short tail ${finish.durationSec}s — advance past ${finish.episodeId}`,
+          );
+          this.crashResumeCounts.delete(key);
+          await clearAirFinish(dir);
+          if (inWindow) {
+            await this.runEncode(slug, tz, profile, false, 'wall-clock', {
+              skipCurrent: true,
+              completedEpisodeIds: [finish.episodeId],
+            });
+            return;
+          }
+          await this.shutdownChannelStream(slug, tz, profile);
+          return;
+        }
         const crashes = (this.crashResumeCounts.get(key) ?? 0) + 1;
         this.crashResumeCounts.set(key, crashes);
         // Credits / last-row hang: don't re-encode the ending forever.
@@ -196,12 +213,11 @@ export class StreamEncodeService {
               finish.scheduleItemId,
             )
           : null;
-        const lastOrCredits =
-          !nextAfter?.length || finish.durationSec <= 120;
+        const lastOrCredits = !nextAfter?.length;
         if (crashes > 3 || (crashes > 1 && lastOrCredits)) {
           this.logger.warn(
             `[${key}] crash resume x${crashes}` +
-              `${lastOrCredits ? ' (last/credits)' : ''} — advance past ${finish.episodeId}`,
+              `${lastOrCredits ? ' (last row)' : ''} — advance past ${finish.episodeId}`,
           );
           this.crashResumeCounts.delete(key);
           await clearAirFinish(dir);

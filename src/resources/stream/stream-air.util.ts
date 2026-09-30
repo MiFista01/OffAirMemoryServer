@@ -230,3 +230,18 @@ export function findPlaylistAfterCompleted(
     durationSec: item.durationSec,
   }));
 }
+
+/**
+ * Continuous debt vs live grid: if the sequential next row is already over
+ * (wall-clock sits on a later order), catch up — don't start a full owed episode
+ * while the guide already shows the next show (JL ending → JL restart vs Total Drama).
+ */
+export function isSequentialBehindWallClock(
+  sequential: PlaylistSegment[] | null | undefined,
+  wallClock: PlaylistSegment[] | null | undefined,
+): boolean {
+  const s = sequential?.[0]?.item?.order;
+  const w = wallClock?.[0]?.item?.order;
+  if (s == null || w == null) return false;
+  return w > s;
+}

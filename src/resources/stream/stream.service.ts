@@ -16,6 +16,7 @@ import {
 } from './air-finish.state';
 import {
   calendarDateInTz,
+  findRemainingPlaylist,
   isFinishingOverrun,
   isWithinAirWindow,
   parseStreamKey,
@@ -154,6 +155,27 @@ export class StreamService implements OnModuleDestroy {
 
       existing.lastAccessAt = Date.now();
       this.ffmpeg.touch(key);
+
+      // Live encode but grid already moved past this slot (reload stuck on JL while TD is on).
+      if (existing.episodeId != null && existing.scheduleItemId != null) {
+        const catchUp = await this.shouldCatchUpPastSlot(
+          slug,
+          tz,
+          existing.scheduleItemId,
+          existing.episodeId,
+        );
+        if (catchUp) {
+          this.logger.warn(
+            `[${key}] /start live encode behind wall-clock (ep=${existing.episodeId}) — catch up`,
+          );
+          this.ffmpeg.stop(key);
+          await clearAirFinish(dir);
+          return this.encode.runEncode(slug, tz, profile, false, 'wall-clock', {
+            completedEpisodeIds: [existing.episodeId],
+          });
+        }
+      }
+
       return jobResponse(this.config, slug, existing);
     }
 
@@ -162,11 +184,28 @@ export class StreamService implements OnModuleDestroy {
     // 2) Resume the cartoon we were encoding (idle kill / Nest restart / cold HLS).
     // Never fall back to wall-clock while the cursor is still valid — that jumps
     // W.I.T.C.H. ending → Dragon Hunters just because the schedule moved on.
+    // Exception: cursor slot fully over on the grid → catch up (reload must not stick).
     const finish = await readAirFinish(dir);
     if (finish) {
       if (finish.date && finish.date !== date) {
         this.logger.log(`[${key}] stale air-finish date=${finish.date} → drop`);
         await clearAirFinish(dir);
+      } else if (
+        finish.scheduleItemId != null &&
+        (await this.shouldCatchUpPastSlot(
+          slug,
+          tz,
+          finish.scheduleItemId,
+          finish.episodeId,
+        ))
+      ) {
+        this.logger.log(
+          `[${key}] air cursor ep=${finish.episodeId} behind wall-clock — catch up`,
+        );
+        await clearAirFinish(dir);
+        return this.encode.runEncode(slug, tz, profile, false, 'wall-clock', {
+          completedEpisodeIds: [finish.episodeId],
+        });
       } else {
         // Long absence: continuous debt would replay hours behind the grid.
         // Cap idle since cursor save — then catch up to wall-clock.
@@ -204,6 +243,33 @@ export class StreamService implements OnModuleDestroy {
     // Otherwise stale live-edge + mid-seek = jump into the future and back.
     const append = await this.ffmpeg.isPlaylistFresh(dir);
     return this.encode.runEncode(slug, tz, profile, append, 'wall-clock');
+  }
+
+  /**
+   * True when the schedule row we are encoding has already ended on the grid
+   * (wall-clock sits on a later order) — /start must not keep serving it.
+   */
+  private async shouldCatchUpPastSlot(
+    slug: string,
+    tz: string,
+    scheduleItemId: number,
+    _episodeId: number,
+  ): Promise<boolean> {
+    const channel = await this.channels.findOne({ slug, isActive: true });
+    if (!channel) return false;
+    const day = await this.encode.loadScheduleDay(channel.id, tz);
+    if (!day?.scheduleItems?.length) return false;
+    const airWindowStart = this.config.get<string>(
+      'AIR_WINDOW_START',
+      AIR_WINDOW_START,
+    );
+    const date = calendarDateInTz(tz);
+    const airStart = windowStartAt(date, airWindowStart, tz);
+    const wall = findRemainingPlaylist(day.scheduleItems, airStart);
+    if (!wall?.length) return false;
+    const cursorItem = day.scheduleItems.find((i) => i.id === scheduleItemId);
+    if (!cursorItem) return false;
+    return wall[0].item.order > cursorItem.order;
   }
 
   stop(slug: string, tz = 'Europe/Tallinn', profile = '720p') {
