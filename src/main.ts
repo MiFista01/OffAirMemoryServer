@@ -16,6 +16,8 @@ import { DocumentBuilder } from '@nestjs/swagger';
 import { SwaggerModule } from '@nestjs/swagger';
 import { NextFunction, Request, Response, static as expressStatic } from 'express';
 import compression from 'compression';
+import { existsSync } from 'fs';
+import { join } from 'path';
 import { BusinessValidationService } from '@utils';
 import { startEnvCheck } from '@constants';
 import session from 'express-session';
@@ -48,13 +50,27 @@ async function bootstrap() {
         res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
         res.setHeader('Accept-Ranges', 'bytes');
         // Viewer is pulling .m3u8/.ts → do not kill encode on idle TTL
-        const folder = req.path.split('/').filter(Boolean)[0];
+        // Dual-slot paths: /{channel}/a/seg.ts — touch channel root.
+        const parts = req.path.split('/').filter(Boolean);
+        const folder = parts[0];
         if (folder) ffmpeg.touchByFolder(folder);
-        // During seek the file is missing. 503 + Retry-After instead of a 404 storm / Global Exception.
-        if (folder && ffmpeg.isFolderPreparing(folder)) {
-          res.setHeader('Retry-After', '2');
-          res.status(503).type('text/plain').send('HLS preparing');
-          return;
+        // During seek/wipe the playlist is missing → 503.
+        // Slot preparing: check channel/a or channel/b.
+        const slotFolder =
+          parts.length >= 2 && (parts[1] === 'a' || parts[1] === 'b')
+            ? `${folder}/${parts[1]}`
+            : folder;
+        if (slotFolder && ffmpeg.isFolderPreparing(slotFolder)) {
+          const playlistPath = join(
+            streamRoot,
+            ...slotFolder.split('/'),
+            'playlist.m3u8',
+          );
+          if (!existsSync(playlistPath)) {
+            res.setHeader('Retry-After', '2');
+            res.status(503).type('text/plain').send('HLS preparing');
+            return;
+          }
         }
         next();
       },
