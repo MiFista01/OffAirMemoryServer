@@ -116,18 +116,23 @@ export function isFinishingOverrun(
   return false;
 }
 
-/** key = `slug:Europe/Tallinn:720p` */
+/** key = `slug:Europe/Tallinn:720p` or `…:720p:a|b` */
 export function parseStreamKey(key: string): {
   slug: string;
   tz: string;
   profile: string;
+  slot?: 'a' | 'b';
 } {
-  const i = key.indexOf(':');
-  const j = key.lastIndexOf(':');
+  const slotMatch = /:(a|b)$/.exec(key);
+  const base = slotMatch ? key.slice(0, -2) : key;
+  const slot = slotMatch ? (slotMatch[1] as 'a' | 'b') : undefined;
+  const i = base.indexOf(':');
+  const j = base.lastIndexOf(':');
   return {
-    slug: key.slice(0, i),
-    tz: key.slice(i + 1, j),
-    profile: key.slice(j + 1),
+    slug: base.slice(0, i),
+    tz: base.slice(i + 1, j),
+    profile: base.slice(j + 1),
+    slot,
   };
 }
 
@@ -232,9 +237,33 @@ export function findPlaylistAfterCompleted(
 }
 
 /**
- * Continuous debt vs live grid: if the sequential next row is already over
- * (wall-clock sits on a later order), catch up — don't start a full owed episode
- * while the guide already shows the next show (JL ending → JL restart vs Total Drama).
+ * Sequential next always starts at 0 — but if the guide is already inside that
+ * same slot (Monkey ran late → Batman standby), seek to wall inpoint so promote
+ * does not show the intro in the middle of the scheduled slot.
+ */
+export function alignPlaylistHeadToWall(
+  playlist: PlaylistSegment[] | null | undefined,
+  wallClock: PlaylistSegment[] | null | undefined,
+): PlaylistSegment[] {
+  if (!playlist?.length) return playlist ?? [];
+  const head = playlist[0];
+  const w = wallClock?.[0];
+  if (!w || head.item.order !== w.item.order || w.inpointSec <= 0) {
+    return playlist;
+  }
+  return [
+    {
+      item: head.item,
+      inpointSec: w.inpointSec,
+      durationSec: w.durationSec,
+    },
+    ...playlist.slice(1),
+  ];
+}
+
+/**
+ * Continuous debt vs live grid: sequential next row's order is already past
+ * on the wall-clock (guide sits on a later show). Callers catch up to the guide.
  */
 export function isSequentialBehindWallClock(
   sequential: PlaylistSegment[] | null | undefined,
@@ -244,4 +273,57 @@ export function isSequentialBehindWallClock(
   const w = wallClock?.[0]?.item?.order;
   if (s == null || w == null) return false;
   return w > s;
+}
+
+/**
+ * Inverse: sequential next is still in the future on the guide.
+ * Starting it now races ahead of the grid (short files / early EOF accumulate drift).
+ */
+export function isSequentialAheadOfWallClock(
+  sequential: PlaylistSegment[] | null | undefined,
+  wallClock: PlaylistSegment[] | null | undefined,
+): boolean {
+  const s = sequential?.[0]?.item?.order;
+  const w = wallClock?.[0]?.item?.order;
+  if (s == null || w == null) return false;
+  return s > w;
+}
+
+/** Wall-clock ms until schedule `order` starts (from air window start). */
+export function msUntilScheduleOrder(
+  items: ScheduleItem[] | null | undefined,
+  order: number,
+  airStart: Date,
+  now = new Date(),
+): number {
+  if (!items?.length) return 0;
+  const sorted = [...items].sort((a, b) => a.order - b.order);
+  let t = airStart.getTime();
+  for (const item of sorted) {
+    if (item.order >= order) {
+      return Math.max(0, t - now.getTime());
+    }
+    t += Math.max(0, item.durationSec) * 1000;
+  }
+  return 0;
+}
+
+/** Wall-clock ms until the schedule row with this id ends. */
+export function msUntilScheduleItemEnd(
+  items: ScheduleItem[] | null | undefined,
+  scheduleItemId: number,
+  airStart: Date,
+  now = new Date(),
+): number {
+  if (!items?.length) return 0;
+  const sorted = [...items].sort((a, b) => a.order - b.order);
+  let t = airStart.getTime();
+  for (const item of sorted) {
+    const end = t + Math.max(0, item.durationSec) * 1000;
+    if (item.id === scheduleItemId) {
+      return Math.max(0, end - now.getTime());
+    }
+    t = end;
+  }
+  return 0;
 }

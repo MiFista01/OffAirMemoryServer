@@ -23,6 +23,8 @@ export async function clampSegmentsToFile(
   segments: HlsSegmentInput[];
   skipEpisodeId?: number;
   path?: string;
+  /** Full file duration from probe (seconds). */
+  fileDurSec?: number;
 }> {
   if (!segments.length) return { segments };
   const head = segments[0];
@@ -39,12 +41,14 @@ export async function clampSegmentsToFile(
       segments,
       skipEpisodeId: episodeId,
       path: head.path,
+      fileDurSec: fileDur,
     };
   }
 
+  // Keep encode window on file truth — tiny epsilon only (was −1.25 and drifted ahead).
   const duration = Math.min(
     head.durationSec,
-    Math.max(1, available - 0.5),
+    Math.max(1, available - 0.05),
   );
   if (
     Math.abs(duration - head.durationSec) > 1.5 ||
@@ -58,21 +62,43 @@ export async function clampSegmentsToFile(
 
   const out = [...segments];
   out[0] = { ...head, inpointSec: inpoint, durationSec: duration };
-  return { segments: out };
+  return { segments: out, fileDurSec: fileDur };
 }
 
-/** Encode is already near the slot ending (job durationSec = remaining at start). */
+/**
+ * Encode is already near the *ffmpeg window* ending.
+ * On seam bridge durationSec is only head A — use encodeWindowSec (A+B) so
+ * /start mid-B does not think we are "in credits" and wall-clock rewind into A.
+ */
 export function isJobNearEpisodeEnd(job: {
   startedAt?: number;
   offsetSec?: number;
   durationSec?: number;
+  encodeWindowSec?: number;
+  segmentCount?: number;
 }): boolean {
-  const remainingAtStart = job.durationSec ?? 0;
-  if (remainingAtStart <= 0) return false;
+  const windowSec =
+    job.encodeWindowSec && job.encodeWindowSec > 0
+      ? job.encodeWindowSec
+      : (job.durationSec ?? 0);
+  if (windowSec <= 0) return false;
   const started = job.startedAt ?? Date.now();
   const elapsed = (Date.now() - started) / 1000;
-  // Previously we wrongly compared inpoint+elapsed to remaining → always "near end".
-  return elapsed >= Math.max(0, remainingAtStart - 60);
+  // Tight window: 60s made stall→/start treat half the credits as "near end"
+  // and rewind/skip. Promote/standby needs only ~12–25s.
+  return elapsed >= Math.max(0, windowSec - 25);
+}
+
+/** Alive multi-file concat (хвост A + начало B) — never kill via /start wall-clock. */
+export function isBridgeEncodeJob(job: {
+  segmentCount?: number;
+  encodeWindowSec?: number;
+  durationSec?: number;
+}): boolean {
+  if ((job.segmentCount ?? 1) > 1) return true;
+  const win = job.encodeWindowSec ?? 0;
+  const head = job.durationSec ?? 0;
+  return win > 0 && head > 0 && win > head + 20;
 }
 
 export function capLookahead<T extends { durationSec: number }>(
