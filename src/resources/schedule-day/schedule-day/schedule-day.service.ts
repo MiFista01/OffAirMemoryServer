@@ -149,7 +149,9 @@ export class ScheduleDayService
 
   @Cron(CronExpression.EVERY_DAY_AT_1AM)
   async createDaySchedule() {
-    const date = todayUtcDate();
+    // Guide/stream use local air TZ — not UTC calendar day (midnight UTC ≠ Tallinn).
+    const tz = this.config.get<string>('AIR_TZ', 'Europe/Tallinn');
+    const date = calendarDateInTz(tz);
     const airTimeSec = this.airTimeSec();
     const channels = await this.channelService.findAllBySearch({
       isActive: true,

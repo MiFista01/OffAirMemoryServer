@@ -16,6 +16,6 @@ import { AirHistoryModule } from 'src/resources/air-history/air-history.module';
   ],
   controllers: [ScheduleDayController],
   providers: [ScheduleDayService],
-  exports: [ScheduleDayService],
+  exports: [ScheduleDayService, ScheduleItemModule],
 })
 export class ScheduleDayModule {}
