@@ -57,8 +57,10 @@ export function buildHlsArgs(
   const listSize = String(config.get<number>('HLS_LIST_SIZE', 30));
   const hlsTime = String(config.get<number>('HLS_TIME', 2));
   // temp_file: atomic m3u8 write (no window where Nest serves 404 on the playlist).
+  // discont_start on append: new ffmpeg PTS must not blend with prior window
+  // (Infinite Train audio under Generator Rex video after mid-seam /start).
   const flags = append
-    ? 'delete_segments+omit_endlist+independent_segments+append_list+temp_file'
+    ? 'delete_segments+omit_endlist+independent_segments+append_list+discont_start+temp_file'
     : 'delete_segments+omit_endlist+independent_segments+temp_file';
 
   return [
@@ -111,10 +113,10 @@ export function buildHlsArgsFastSeek(
   const listSize = String(config.get<number>('HLS_LIST_SIZE', 30));
   const hlsTime = String(config.get<number>('HLS_TIME', 2));
   const flags = append
-    ? 'delete_segments+omit_endlist+independent_segments+append_list+temp_file'
+    ? 'delete_segments+omit_endlist+independent_segments+append_list+discont_start+temp_file'
     : 'delete_segments+omit_endlist+independent_segments+temp_file';
   const ss = Math.max(0, inpointSec);
-  const dur = Math.max(1, durationSec - 1.25);
+  const dur = Math.max(1, durationSec - 0.05);
 
   return [
     '-hide_banner',

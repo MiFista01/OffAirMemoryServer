@@ -18,6 +18,12 @@ import {
   sweepOrphanSegments,
 } from './ffmpeg-playlist';
 import { startHlsUnlocked, type FfmpegStartHost } from './ffmpeg-start-hls';
+import {
+  otherSlot,
+  streamChannelKey,
+  streamJobKey,
+  type StreamSlot,
+} from './stream-slot.util';
 
 @Injectable()
 export class FfmpegService implements OnModuleDestroy {
@@ -29,16 +35,113 @@ export class FfmpegService implements OnModuleDestroy {
   private readonly rollingHandoff = new Set<string>();
   private readonly stallSkip = new Set<string>();
   private readonly handoffTimers = new Map<string, NodeJS.Timeout>();
+  /** Active HLS slot per channel (`slug:tz:profile` → a|b). */
+  private readonly activeSlots = new Map<string, StreamSlot>();
+  /** Standby slot currently warming (if any). */
+  private readonly standbySlots = new Map<string, StreamSlot>();
+  private readonly retireTimers = new Map<string, NodeJS.Timeout>();
 
   /** Serialize folder wipes so /start cannot spawn into a half-deleted HLS dir. */
   private readonly clearLocks = new Map<string, Promise<void>>();
   /**
    * Folder names mid stop→clear→spawn (no job.ready yet).
    * Static /stream must 503 here — bare 404 makes the client reboot-storm.
+   * May be `channelFolder` or `channelFolder/a`.
    */
   private readonly preparingFolders = new Set<string>();
 
   constructor(private readonly config: ConfigService) {}
+
+  getActiveSlot(channelKey: string): StreamSlot {
+    return this.activeSlots.get(channelKey) ?? 'a';
+  }
+
+  setActiveSlot(channelKey: string, slot: StreamSlot): void {
+    this.activeSlots.set(channelKey, slot);
+  }
+
+  getStandbySlot(channelKey: string): StreamSlot | undefined {
+    return this.standbySlots.get(channelKey);
+  }
+
+  setStandbySlot(channelKey: string, slot: StreamSlot | undefined): void {
+    if (slot) this.standbySlots.set(channelKey, slot);
+    else this.standbySlots.delete(channelKey);
+  }
+
+  /** Resolve active encode for channel key without slot suffix. */
+  getActive(channelKey: string): FfmpegJob | undefined {
+    const legacy = this.jobs.get(channelKey);
+    if (legacy && this.isAlive(legacy)) return legacy;
+    const slot = this.getActiveSlot(channelKey);
+    const { slug, tz, profile } = parseStreamKey(channelKey);
+    return this.jobs.get(streamJobKey(slug, tz, profile, slot));
+  }
+
+  getBySlot(channelKey: string, slot: StreamSlot): FfmpegJob | undefined {
+    const { slug, tz, profile } = parseStreamKey(channelKey);
+    return this.jobs.get(streamJobKey(slug, tz, profile, slot));
+  }
+
+  /** Stop both slots + clear active/standby bookkeeping. */
+  stopChannel(channelKey: string): void {
+    const t = this.retireTimers.get(channelKey);
+    if (t) clearTimeout(t);
+    this.retireTimers.delete(channelKey);
+    this.standbySlots.delete(channelKey);
+    this.activeSlots.delete(channelKey);
+    const { slug, tz, profile } = parseStreamKey(channelKey);
+    for (const slot of ['a', 'b'] as StreamSlot[]) {
+      this.stop(streamJobKey(slug, tz, profile, slot));
+    }
+    // Legacy key (pre-slot)
+    this.stop(channelKey);
+  }
+
+  /** Keep idle TTL alive for active + warming standby (same viewer). */
+  touchChannel(channelKey: string): void {
+    const active = this.getActive(channelKey);
+    if (active) active.lastAccessAt = Date.now();
+    const sb = this.getStandbySlot(channelKey);
+    if (!sb) return;
+    const standbyJob = this.getBySlot(channelKey, sb);
+    if (standbyJob) standbyJob.lastAccessAt = Date.now();
+  }
+
+  /** Absolute HLS dir for the active slot (or legacy channel root). */
+  activeHlsDir(streamRoot: string, channelFolder: string, channelKey: string): string {
+    const job = this.getActive(channelKey);
+    const slot = job?.slot ?? this.getActiveSlot(channelKey);
+    if (job?.dir) return job.dir;
+    return join(streamRoot, channelFolder, slot);
+  }
+
+  scheduleRetireSlot(
+    channelKey: string,
+    slot: StreamSlot,
+    delayMs: number,
+  ): void {
+    const prev = this.retireTimers.get(channelKey);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      this.retireTimers.delete(channelKey);
+      const { slug, tz, profile } = parseStreamKey(channelKey);
+      const jobKey = streamJobKey(slug, tz, profile, slot);
+      this.logger.log(`[${channelKey}] retire slot=${slot}`);
+      void this.stopAndClear(jobKey).catch((e) =>
+        this.logger.warn(`[${channelKey}] retire slot=${slot} failed: ${e}`),
+      );
+    }, delayMs);
+    this.retireTimers.set(channelKey, timer);
+  }
+
+  nextStandbySlot(channelKey: string): StreamSlot {
+    return otherSlot(this.getActiveSlot(channelKey));
+  }
+
+  channelKeyOf(slug: string, tz: string, profile: string): string {
+    return streamChannelKey(slug, tz, profile);
+  }
 
   markPreparing(folderName: string): void {
     if (folderName) this.preparingFolders.add(folderName);
@@ -94,28 +197,36 @@ export class FfmpegService implements OnModuleDestroy {
   }
 
   get(key: string) {
-    return this.jobs.get(key);
+    // Prefer exact key; if channel key without slot — resolve active.
+    const exact = this.jobs.get(key);
+    if (exact) return exact;
+    if (/:(a|b)$/.test(key)) return undefined;
+    return this.getActive(key);
   }
 
   touch(key: string) {
-    const job = this.jobs.get(key);
+    const job = this.get(key);
     if (job) job.lastAccessAt = Date.now();
   }
 
-  /** Touch by HLS folder name (`slug_Europe-Tallinn_720p`) — from /stream requests. */
+  /** Touch by HLS folder name — channel root or `channel/a`. */
   touchByFolder(folderName: string): boolean {
     if (!folderName) return false;
+    let touched = false;
     for (const job of this.jobs.values()) {
+      const dir = job.dir.replace(/\\/g, '/');
+      const url = job.playlistUrl;
       if (
-        job.dir.replace(/\\/g, '/').endsWith(`/${folderName}`) ||
-        job.dir.endsWith(folderName) ||
-        job.playlistUrl.includes(`/${folderName}/`)
+        dir.endsWith(`/${folderName}`) ||
+        dir.includes(`/${folderName}/`) ||
+        dir.endsWith(folderName) ||
+        url.includes(`/${folderName}/`)
       ) {
         job.lastAccessAt = Date.now();
-        return true;
+        touched = true;
       }
     }
-    return false;
+    return touched;
   }
 
   /**
@@ -125,11 +236,17 @@ export class FfmpegService implements OnModuleDestroy {
   isFolderPreparing(folderName: string): boolean {
     if (!folderName) return false;
     if (this.preparingFolders.has(folderName)) return true;
+    // Nested slot: preparing marked as `channel/a`
+    for (const p of this.preparingFolders) {
+      if (p === folderName || p.startsWith(`${folderName}/`)) return true;
+    }
     for (const job of this.jobs.values()) {
       if (!this.isAlive(job) || job.ready) continue;
+      const dir = job.dir.replace(/\\/g, '/');
       if (
-        job.dir.replace(/\\/g, '/').endsWith(`/${folderName}`) ||
-        job.dir.endsWith(folderName) ||
+        dir.endsWith(`/${folderName}`) ||
+        dir.includes(`/${folderName}/`) ||
+        dir.endsWith(folderName) ||
         job.playlistUrl.includes(`/${folderName}/`)
       ) {
         return true;
@@ -150,6 +267,10 @@ export class FfmpegService implements OnModuleDestroy {
     _freshRetry?: boolean;
     onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
     onStallEnd?: () => void | Promise<void>;
+    /** Dual-slot: spawn next encode in the other slot ~bridgeSec before EOF (no kill). */
+    onStandbyPrep?: () => void | Promise<void>;
+    slot?: 'a' | 'b';
+    channelKey?: string;
   }): Promise<FfmpegJob> {
     const prev = this.startLocks.get(opts.key);
     if (prev) {
@@ -211,25 +332,27 @@ export class FfmpegService implements OnModuleDestroy {
    * or quietly if already dead.
    */
   requestStallSkip(key: string): boolean {
-    const job = this.jobs.get(key);
+    const job = this.jobs.get(key) ?? this.getActive(key);
     if (!job || !this.isAlive(job)) return false;
-    this.rollingHandoff.add(key);
-    this.stallSkip.add(key);
-    this.clearHandoffTimer(key);
+    const jobKey = job.key;
+    this.rollingHandoff.add(jobKey);
+    this.stallSkip.add(jobKey);
+    this.clearHandoffTimer(jobKey);
     job.process.kill('SIGTERM');
     return true;
   }
 
 
   stop(key: string) {
-    this.stopped.add(key);
-    this.rollingHandoff.delete(key);
-    this.stallSkip.delete(key);
-    this.clearHandoffTimer(key);
-    const job = this.jobs.get(key);
+    const job = this.jobs.get(key) ?? (!/:(a|b)$/.test(key) ? this.getActive(key) : undefined);
+    const jobKey = job?.key ?? key;
+    this.stopped.add(jobKey);
+    this.rollingHandoff.delete(jobKey);
+    this.stallSkip.delete(jobKey);
+    this.clearHandoffTimer(jobKey);
     if (!job) return false;
     job.process.kill('SIGTERM');
-    this.jobs.delete(key);
+    this.jobs.delete(jobKey);
     // Do NOT sweep orphans here — races with append restart writing new .ts.
     return true;
   }
@@ -253,7 +376,10 @@ export class FfmpegService implements OnModuleDestroy {
   async stopAndClear(key: string): Promise<boolean> {
     const job = this.jobs.get(key);
     const dir = job?.dir;
-    const folder = dir?.replace(/\\/g, '/').split('/').pop();
+    // Dual-slot: preparing key is `channelFolder/a` (not just `a`).
+    const norm = dir?.replace(/\\/g, '/') ?? '';
+    const folder =
+      /\/([^/]+\/[ab])$/.exec(norm)?.[1] ?? norm.split('/').pop();
     if (folder) this.markPreparing(folder);
     const stopped = this.stop(key);
     if (dir) {
@@ -271,7 +397,6 @@ export class FfmpegService implements OnModuleDestroy {
       this.config.get('STREAM_IDLE_TTL_SEC', STREAM_IDLE_TTL_SEC),
     );
     const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? ttlSec : STREAM_IDLE_TTL_SEC;
-    const grace = this.startGraceSec();
     const cutoff = Date.now() - ttl * 1000;
     for (const [key, job] of this.jobs) {
       if (this.isAlive(job)) {
@@ -282,6 +407,22 @@ export class FfmpegService implements OnModuleDestroy {
       if (!job.ready && !this.isSeekStuck(job)) {
         continue;
       }
+
+      // Dual-slot: never reap standby while active is still watched.
+      const channelKey =
+        job.channelKey ??
+        (job.key.endsWith(':a') || job.key.endsWith(':b')
+          ? job.key.slice(0, -2)
+          : job.key);
+      const standbySlot = this.getStandbySlot(channelKey);
+      if (standbySlot && job.slot === standbySlot) {
+        const active = this.getActive(channelKey);
+        if (active && this.isAlive(active) && active.lastAccessAt >= cutoff) {
+          job.lastAccessAt = Date.now();
+          continue;
+        }
+      }
+
       // Mark touched so the next 15s tick doesn't double-reap while we await disk.
       job.lastAccessAt = Date.now();
       this.logger.log(
@@ -311,18 +452,39 @@ export class FfmpegService implements OnModuleDestroy {
     bumpGeneration = false,
   ): Promise<void> {
     if (!job.mediaPath || !job.episodeId || !job.durationSec) return;
+    // Standby must not clobber the active episode's air-finish cursor.
+    if (job.channelKey && job.slot) {
+      const sb = this.getStandbySlot(job.channelKey);
+      if (sb === job.slot) {
+        this.logger.log(
+          `[${job.key}] skip cursor persist — standby slot (active still on air)`,
+        );
+        return;
+      }
+    }
     const elapsed = Math.max(
       0,
       (Date.now() - (job.startedAt ?? Date.now())) / 1000,
     );
     const inpoint = Math.floor((job.offsetSec ?? 0) + elapsed);
     const remain = Math.max(1, Math.floor(job.durationSec - elapsed));
+    // Don't persist a credits stub — next /start would loop the ending.
+    if (remain <= 45) {
+      this.logger.log(
+        `[${job.key}] skip cursor persist (only ${remain}s left — treat as done)`,
+      );
+      return;
+    }
     const { tz } = parseStreamKey(job.key);
-    const prev = await readAirFinish(job.dir);
+    // Dual-slot: HLS is in …/a|b — air-finish stays on the channel root.
+    const cursorDir = /[/\\][ab]$/.test(job.dir.replace(/\\/g, '/'))
+      ? job.dir.replace(/[/\\][ab]$/, '')
+      : job.dir;
+    const prev = await readAirFinish(cursorDir);
     const generation = bumpGeneration
       ? (prev?.generation ?? 0) + 1
       : (prev?.generation ?? 1);
-    await writeAirFinish(job.dir, {
+    await writeAirFinish(cursorDir, {
       date: calendarDateInTz(tz),
       episodeId: job.episodeId,
       scheduleItemId: job.scheduleItemId,

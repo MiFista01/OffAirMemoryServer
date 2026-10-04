@@ -50,6 +50,10 @@ export async function startHlsUnlocked(
     _freshRetry?: boolean;
     onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
     onStallEnd?: () => void | Promise<void>;
+    /** Dual-slot: prep next cartoon without killing this encode. */
+    onStandbyPrep?: () => void | Promise<void>;
+    slot?: 'a' | 'b';
+    channelKey?: string;
   }): Promise<FfmpegJob> {
     host.stopped.delete(opts.key);
     const playlist = join(opts.streamRoot, opts.folderName, 'playlist.m3u8');
@@ -91,18 +95,15 @@ export async function startHlsUnlocked(
       );
       append = false;
     }
-    // After idle/channel switch, stale live-edge + new mid-seek =
-    // a jump into the future then rollback. Append only while segments are hot.
-    if (append && !(await host.isPlaylistFresh(dir))) {
-      host.logger.warn(
-        `[${opts.key}] HLS cold (idle/channel switch) — fresh start`,
-      );
-      append = false;
-    }
+    // Do NOT drop append just because .ts stopped updating (ffmpeg was killed for
+    // rolling/bridge). That wiped playlist.m3u8 → nginx 503 mid-watch.
+    // Idle/cold callers already pass append=false when isPlaylistFresh is false.
 
     // Kill previous ffmpeg FIRST — otherwise Windows EBUSY on concat.txt/.ts wipe.
     host.stop(opts.key);
-    host.markPreparing(opts.folderName);
+    // Only block static /stream when we wipe the folder. Append keeps playlist.m3u8
+    // playable so the TV buffer does not go black during the seam.
+    if (!append) host.markPreparing(opts.folderName);
     let child: ReturnType<typeof spawn>;
     let startNumber: number;
     let firstSeg: (typeof opts.segments)[0];
@@ -127,7 +128,7 @@ export async function startHlsUnlocked(
         for (const s of opts.segments) {
           const file = s.path.replace(/\\/g, '/').replace(/'/g, "'\\''");
           const inpoint = Math.max(0, s.inpointSec);
-          const outpoint = inpoint + Math.max(1, s.durationSec) - 1.25;
+          const outpoint = inpoint + Math.max(1, s.durationSec) - 0.05;
           lines.push(`file '${file}'`);
           if (inpoint > 0) lines.push(`inpoint ${inpoint}`);
           lines.push(`outpoint ${outpoint}`);
@@ -208,6 +209,7 @@ export async function startHlsUnlocked(
       );
     });
 
+    const windowSec = opts.segments.reduce((s, x) => s + x.durationSec, 0);
     const job: FfmpegJob = {
       key: opts.key,
       process: child,
@@ -217,51 +219,115 @@ export async function startHlsUnlocked(
       startedAt: Date.now(),
       ready: false,
       onNaturalEnd: opts.onNaturalEnd,
+      encodeWindowSec: windowSec,
+      segmentCount: opts.segments.length,
+      slot: opts.slot,
+      channelKey: opts.channelKey,
     };
     host.jobs.set(opts.key, job);
 
-    const windowSec = opts.segments.reduce((s, x) => s + x.durationSec, 0);
     const leadSec = 30;
-    if (opts.rollingHandoff && opts.onNaturalEnd && windowSec > leadSec + 180) {
-      const delayMs = (windowSec - leadSec) * 1000;
+
+    const armRollingKill = (label: string, delayMs: number) => {
       const timer = setTimeout(() => {
-        const current = host.jobs.get(opts.key);
-        if (!current || current.process !== child) return;
-        host.logger.log(
-          `[${opts.key}] rolling handoff (~${leadSec}s before window end)`,
-        );
-        host.rollingHandoff.add(opts.key);
-        child.kill('SIGTERM');
+        void (async () => {
+          const current = host.jobs.get(opts.key);
+          if (!current || current.process !== child) return;
+          try {
+            // Keep playhead so resume appends — never wipe mid-seam.
+            await host.persistJobCursor(current, false);
+          } catch (e) {
+            host.logger.warn(`[${opts.key}] handoff cursor save failed: ${e}`);
+          }
+          host.logger.log(`[${opts.key}] ${label}`);
+          host.rollingHandoff.add(opts.key);
+          child.kill('SIGTERM');
+        })();
       }, delayMs);
       host.handoffTimers.set(opts.key, timer);
+    };
+
+    if (opts.rollingHandoff && opts.onNaturalEnd && windowSec > leadSec + 180) {
+      armRollingKill(
+        `rolling handoff (~${leadSec}s before window end)`,
+        (windowSec - leadSec) * 1000,
+      );
     } else if (
       // Mid-episode solo: ffmpeg often hangs on credits/EOF and never exits.
       // Without a timer we only recover via stall (or channel switch → /start).
       !opts.rollingHandoff &&
       opts.segments.length === 1 &&
-      (opts.onStallEnd || opts.onNaturalEnd) &&
+      (opts.onStallEnd || opts.onNaturalEnd || opts.onStandbyPrep) &&
       windowSec >= 25
     ) {
-      const earlySec = Math.min(
-        10,
-        Math.max(4, Math.floor(windowSec * 0.04)),
-      );
-      const delayMs = Math.max(12_000, (windowSec - earlySec) * 1000);
-      const timer = setTimeout(() => {
-        const current = host.jobs.get(opts.key);
-        if (!current || current.process !== child) return;
-        host.logger.log(
-          `[${opts.key}] solo seam handoff (~${earlySec}s before window end, ${windowSec}s slot)`,
+      const bridgeCfg = Number(host.config.get('STREAM_SEAM_BRIDGE_SEC', 180));
+      const bridgeSec =
+        Number.isFinite(bridgeCfg) && bridgeCfg > 0 ? bridgeCfg : 180;
+      // Dual-slot: spawn standby in the other folder before EOF —
+      // do NOT kill this encode (client keeps playing until switch).
+      // Short episodes (< bridge+45): still prep standby with a shorter lead.
+      if (opts.onStandbyPrep && windowSec >= 40) {
+        // Longer lead so standby is warm before EOF (invisible seam).
+        // Client dual-slot attach uses startPosition:0 — safe even if standby
+        // has been encoding for ~45–60s (no live-edge intro skip).
+        const prepLead = Math.min(
+          55,
+          Math.max(35, Math.floor(windowSec * 0.12)),
         );
-        // Prefer stall-skip path → completedEpisodeIds + next slot (Time Squad → Dexter)
-        if (opts.onStallEnd) {
-          host.stallSkip.add(opts.key);
-        } else {
-          host.rollingHandoff.add(opts.key);
-        }
-        child.kill('SIGTERM');
-      }, delayMs);
-      host.handoffTimers.set(opts.key, timer);
+        const delayMs = Math.max(8_000, (windowSec - prepLead) * 1000);
+        const timer = setTimeout(() => {
+          const current = host.jobs.get(opts.key);
+          if (!current || current.process !== child) return;
+          host.logger.log(
+            `[${opts.key}] dual-slot standby prep (~${prepLead}s lead of ${Math.round(windowSec)}s)`,
+          );
+          void Promise.resolve(opts.onStandbyPrep!()).catch((e) =>
+            host.logger.warn(`[${opts.key}] standby prep failed: ${e}`),
+          );
+        }, delayMs);
+        host.handoffTimers.set(opts.key, timer);
+      } else if (opts.onStandbyPrep && windowSec >= 25) {
+        // Very short: start standby ASAP so next is ready near EOF.
+        const delayMs = Math.max(5_000, Math.floor(windowSec * 0.4) * 1000);
+        const timer = setTimeout(() => {
+          const current = host.jobs.get(opts.key);
+          if (!current || current.process !== child) return;
+          host.logger.log(
+            `[${opts.key}] dual-slot standby prep (short ${Math.round(windowSec)}s)`,
+          );
+          void Promise.resolve(opts.onStandbyPrep!()).catch((e) =>
+            host.logger.warn(`[${opts.key}] standby prep failed: ${e}`),
+          );
+        }, delayMs);
+        host.handoffTimers.set(opts.key, timer);
+      } else if (opts.onNaturalEnd && windowSec > bridgeSec + 45 && !opts.onStandbyPrep) {
+        // Legacy concat bridge path (disabled when onStandbyPrep is set).
+        armRollingKill(
+          `solo→bridge handoff (~${bridgeSec}s left of ${Math.round(windowSec)}s)`,
+          Math.max(15_000, (windowSec - bridgeSec) * 1000),
+        );
+      } else {
+        const earlySec = Math.min(
+          10,
+          Math.max(4, Math.floor(windowSec * 0.04)),
+        );
+        const delayMs = Math.max(12_000, (windowSec - earlySec) * 1000);
+        const timer = setTimeout(() => {
+          const current = host.jobs.get(opts.key);
+          if (!current || current.process !== child) return;
+          host.logger.log(
+            `[${opts.key}] solo seam handoff (~${earlySec}s before window end, ${windowSec}s slot)`,
+          );
+          // Prefer stall-skip path → completedEpisodeIds + next slot (Time Squad → Dexter)
+          if (opts.onStallEnd) {
+            host.stallSkip.add(opts.key);
+          } else {
+            host.rollingHandoff.add(opts.key);
+          }
+          child.kill('SIGTERM');
+        }, delayMs);
+        host.handoffTimers.set(opts.key, timer);
+      }
     }
 
     // Append/seam — short wait. Cold (channel switch / after idle) — wait for the first .ts,
