@@ -33,6 +33,8 @@ export type MediaScanStatus = {
     durationMs: number;
     created: ScanCounters;
     existing: ScanCounters;
+    removed: ScanCounters;
+    reactivated: ScanCounters;
     durations: { filled: number; failed: number };
     error: string | null;
   } | null;
@@ -45,10 +47,18 @@ export type ScanCounters = {
   episodes: number;
 };
 
+export type ScanEpisodeRef = {
+  id: number;
+  cartoonId: number;
+  relativePath: string;
+  isActive: boolean;
+};
+
 export type ScanIndex = {
   channelBySlug: Map<string, Channel>;
   cartoonByKey: Map<string, ChannelCartoon>;
-  episodeByPath: Set<string>;
+  /** cartoonId:relativePath → episode row */
+  episodeByPath: Map<string, ScanEpisodeRef>;
 };
 
 export type ScanContext = {
@@ -56,6 +66,10 @@ export type ScanContext = {
   index: ScanIndex;
   created: ScanCounters;
   existing: ScanCounters;
+  removed: ScanCounters;
+  reactivated: ScanCounters;
+  /** Paths seen on disk this scan (cartoonId:relativePath). */
+  seenEpisodePaths: Set<string>;
 };
 
 export type FfmpegJob = {
@@ -75,7 +89,16 @@ export type FfmpegJob = {
   remainingCount?: number;
   mediaPath?: string;
   relativePath?: string;
+  /** Remaining duration of the *head* episode at encode start (not full bridge). */
   durationSec?: number;
+  /** Sum of all concat segments (A+B on seam bridge). Use for near-end checks. */
+  encodeWindowSec?: number;
+  /** Number of media files in this ffmpeg concat (≥2 = seam bridge). */
+  segmentCount?: number;
+  /** Dual-slot toggle: a|b subfolder under channel HLS dir. */
+  slot?: 'a' | 'b';
+  /** Channel key without slot (`slug:tz:profile`). */
+  channelKey?: string;
 };
 
 export enum StreamProfile {
