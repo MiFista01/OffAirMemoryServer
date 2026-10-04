@@ -28,11 +28,26 @@ export class GlobalErrorsFilter
   }
   catch(exception: HttpException, host: ArgumentsHost) {
     const ctx = host.switchToHttp();
-    const msg = `${exception.message} - Request: ${this.reqMsg(ctx)} - Status: ${exception.getStatus()}`;
+    const status = exception.getStatus();
+    const bare = exception.message ?? '';
+    // Browser / probe hitting API root — not an app fault.
+    if (status === 404 && /^Cannot GET \//i.test(bare)) {
+      this.resMsg(ctx, status, { message: bare });
+      return;
+    }
+    // Intentional encode abort while waiting for the guide — warn, not error spam.
+    if (status === 400 && /air-grid-hold/i.test(bare)) {
+      this.logMessage('warn', 'air-grid-hold', {
+        msg: `${bare} - Request: ${this.reqMsg(ctx)}`,
+      });
+      this.resMsg(ctx, status, { message: bare });
+      return;
+    }
+    const msg = `${bare} - Request: ${this.reqMsg(ctx)} - Status: ${status}`;
     this.logMessage('error', 'Global Exception', {
-      error: exception.message,
+      error: bare,
       msg: msg,
     });
-    this.resMsg(ctx, exception.getStatus(), { message: exception.message });
+    this.resMsg(ctx, status, { message: bare });
   }
 }
