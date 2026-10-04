@@ -1,13 +1,18 @@
 import { Module, forwardRef } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { Channel, ChannelCartoon, ChannelEpisode } from '@entities';
+import { Channel, ChannelCartoon, ChannelEpisode, ScheduleItem } from '@entities';
 import { MediaScanController } from './media-scan.controller';
 import { MediaScanService } from './media-scan.service';
 import { ScheduleDayModule } from 'src/resources/schedule-day/schedule-day/schedule-day.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Channel, ChannelCartoon, ChannelEpisode]),
+    TypeOrmModule.forFeature([
+      Channel,
+      ChannelCartoon,
+      ChannelEpisode,
+      ScheduleItem,
+    ]),
     forwardRef(() => ScheduleDayModule),
   ],
   controllers: [MediaScanController],
