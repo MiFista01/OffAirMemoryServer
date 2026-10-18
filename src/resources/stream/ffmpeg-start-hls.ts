@@ -267,12 +267,11 @@ export async function startHlsUnlocked(
       // do NOT kill this encode (client keeps playing until switch).
       // Short episodes (< bridge+45): still prep standby with a shorter lead.
       if (opts.onStandbyPrep && windowSec >= 40) {
-        // Longer lead so standby is warm before EOF (invisible seam).
-        // Client dual-slot attach uses startPosition:0 — safe even if standby
-        // has been encoding for ~45–60s (no live-edge intro skip).
+        // Warm next episode ~30–40s before EOF so intro .ts exist at promote.
+        // Longer lead + -re burns past intro if promote is deferred — keep ≤40s.
         const prepLead = Math.min(
-          55,
-          Math.max(35, Math.floor(windowSec * 0.12)),
+          40,
+          Math.max(30, Math.floor(windowSec * 0.1)),
         );
         const delayMs = Math.max(8_000, (windowSec - prepLead) * 1000);
         const timer = setTimeout(() => {

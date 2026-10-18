@@ -49,7 +49,7 @@ export type StreamRunEncodeHost = {
     slug: string,
     tz: string,
     profile: string,
-  ): void | Promise<void>;
+  ): void | Promise<void | 'promoted' | 'deferred' | 'failed'>;
   /** Dual-slot: poll until standby ready + active near end, then promote. */
   watchStandbyPromote?(
     slug: string,

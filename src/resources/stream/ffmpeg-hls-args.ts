@@ -29,18 +29,19 @@ export function videoEncodeArgs(config: ConfigService): string[] {
   if (override?.trim()) return parseArgs(override);
 
   if (hwMode(config) === 'vaapi') {
-    // iGPU (Intel UHD on 8505): encode off CPU. Soft decode → hwupload → h264_vaapi.
+    // ~2.2 Mbps + ≤720p: ~1 GB/h mobile vs former 4 Mbps (~2 GB/h).
+    // scale before hwupload (no upscale if source already smaller).
     return parseArgs(
-      '-vf format=nv12,hwupload -c:v h264_vaapi -b:v 4000k -maxrate 4500k -bufsize 8000k -g 48',
+      "-vf scale=w='min(1280,iw)':h=-2,format=nv12,hwupload -c:v h264_vaapi -b:v 2200k -maxrate 2500k -bufsize 5000k -g 48",
     );
   }
   if (hwMode(config) === 'qsv') {
     return parseArgs(
-      '-c:v h264_qsv -preset veryfast -global_quality 21 -look_ahead 0 -b:v 4000k -maxrate 4500k -bufsize 8000k -g 48',
+      "-vf scale=w='min(1280,iw)':h=-2 -c:v h264_qsv -preset veryfast -look_ahead 0 -b:v 2200k -maxrate 2500k -bufsize 5000k -g 48",
     );
   }
   return parseArgs(
-    '-c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p -crf 19 -maxrate 4000k -bufsize 8000k -g 48 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv',
+    "-vf scale=w='min(1280,iw)':h=-2 -c:v libx264 -preset veryfast -profile:v high -pix_fmt yuv420p -crf 23 -maxrate 2200k -bufsize 4400k -g 48 -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv",
   );
 }
 
@@ -52,9 +53,9 @@ export function buildHlsArgs(
   startNumber: number,
 ): string[] {
   const audioArgs = parseArgs(
-    config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 160k'),
+    config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 96k'),
   );
-  const listSize = String(config.get<number>('HLS_LIST_SIZE', 30));
+  const listSize = String(config.get<number>('HLS_LIST_SIZE', 48));
   const hlsTime = String(config.get<number>('HLS_TIME', 2));
   // temp_file: atomic m3u8 write (no window where Nest serves 404 on the playlist).
   // discont_start on append: new ffmpeg PTS must not blend with prior window
@@ -88,7 +89,7 @@ export function buildHlsArgs(
     '-hls_list_size',
     listSize,
     '-hls_delete_threshold',
-    '12',
+    '24',
     '-start_number',
     String(startNumber),
     '-hls_flags',
@@ -108,9 +109,9 @@ export function buildHlsArgsFastSeek(
   startNumber: number,
 ): string[] {
   const audioArgs = parseArgs(
-    config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 160k'),
+    config.get<string>('FFMPEG_AUDIO_ARGS', '-c:a aac -b:a 96k'),
   );
-  const listSize = String(config.get<number>('HLS_LIST_SIZE', 30));
+  const listSize = String(config.get<number>('HLS_LIST_SIZE', 48));
   const hlsTime = String(config.get<number>('HLS_TIME', 2));
   const flags = append
     ? 'delete_segments+omit_endlist+independent_segments+append_list+discont_start+temp_file'
@@ -143,7 +144,7 @@ export function buildHlsArgsFastSeek(
     '-hls_list_size',
     listSize,
     '-hls_delete_threshold',
-    '12',
+    '24',
     '-start_number',
     String(startNumber),
     '-hls_flags',

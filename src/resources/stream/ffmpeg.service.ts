@@ -116,6 +116,11 @@ export class FfmpegService implements OnModuleDestroy {
     return join(streamRoot, channelFolder, slot);
   }
 
+  /**
+   * After promote: kill old encode immediately and remove playlist so a stray
+   * client poll cannot briefly replay the previous show's credits (X-Men under Kim).
+   * Full .ts wipe follows after a short delay (file handles / Windows EBUSY).
+   */
   scheduleRetireSlot(
     channelKey: string,
     slot: StreamSlot,
@@ -123,15 +128,33 @@ export class FfmpegService implements OnModuleDestroy {
   ): void {
     const prev = this.retireTimers.get(channelKey);
     if (prev) clearTimeout(prev);
+    const { slug, tz, profile } = parseStreamKey(channelKey);
+    const jobKey = streamJobKey(slug, tz, profile, slot);
+    const job = this.getBySlot(channelKey, slot);
+    const dir = job?.dir;
+    // Stop writing immediately — do not leave old ffmpeg updating m3u8 for 45s.
+    this.stop(jobKey);
+    if (dir) {
+      void (async () => {
+        try {
+          const { unlink } = await import('fs/promises');
+          await unlink(join(dir, 'playlist.m3u8')).catch(() => undefined);
+          this.logger.log(
+            `[${channelKey}] retire slot=${slot} — stopped + playlist removed`,
+          );
+        } catch {
+          /* ignore */
+        }
+      })();
+    }
+    const wipeDelay = Math.min(Math.max(delayMs, 3_000), 12_000);
     const timer = setTimeout(() => {
       this.retireTimers.delete(channelKey);
-      const { slug, tz, profile } = parseStreamKey(channelKey);
-      const jobKey = streamJobKey(slug, tz, profile, slot);
-      this.logger.log(`[${channelKey}] retire slot=${slot}`);
+      this.logger.log(`[${channelKey}] retire slot=${slot} — wipe`);
       void this.stopAndClear(jobKey).catch((e) =>
         this.logger.warn(`[${channelKey}] retire slot=${slot} failed: ${e}`),
       );
-    }, delayMs);
+    }, wipeDelay);
     this.retireTimers.set(channelKey, timer);
   }
 
@@ -253,6 +276,21 @@ export class FfmpegService implements OnModuleDestroy {
       }
     }
     return false;
+  }
+
+  /**
+   * Preparing for the ACTIVE slot only.
+   * Standby cold-seek must NOT make socket/seam report "Подключаем эфир…"
+   * while the live slot is still playing.
+   */
+  isActiveSlotPreparing(channelKey: string, channelFolder: string): boolean {
+    if (!channelFolder) return false;
+    const slot = this.getActiveSlot(channelKey);
+    const activeFolder = `${channelFolder}/${slot}`;
+    if (this.preparingFolders.has(activeFolder)) return true;
+    if (this.preparingFolders.has(channelFolder)) return true;
+    const job = this.getActive(channelKey);
+    return !!(job && this.isAlive(job) && !job.ready);
   }
 
   async startHls(opts: {
@@ -509,6 +547,14 @@ export class FfmpegService implements OnModuleDestroy {
     for (const [key, job] of this.jobs) {
       if (!this.isAlive(job)) continue;
       if (this.rollingHandoff.has(key)) continue;
+      // Never stall-kill a warming standby — cold seek has long gaps with no new .ts.
+      const channelKey =
+        job.channelKey ??
+        (job.key.endsWith(':a') || job.key.endsWith(':b')
+          ? job.key.slice(0, -2)
+          : job.key);
+      const standbySlot = this.getStandbySlot(channelKey);
+      if (standbySlot && job.slot === standbySlot) continue;
       const ageMs = await newestSegmentAgeMs(job.dir);
       if (ageMs == null) continue;
       if (ageMs < stallSec * 1000) continue;

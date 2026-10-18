@@ -36,7 +36,12 @@ import {
 import { StreamRunEncodeService } from './stream-run-encode.service';
 import type { StreamRunEncodeHost } from './stream-encode.types';
 import { StreamRealtimeService } from './stream-realtime.service';
-import { streamJobKey, streamSlotFolder } from './stream-slot.util';
+import {
+  streamJobKey,
+  streamSlotFolder,
+  type StreamSlot,
+} from './stream-slot.util';
+import type { FfmpegJob } from '@app-types';
 
 @Injectable()
 export class StreamEncodeService {
@@ -166,18 +171,84 @@ export class StreamEncodeService {
     return wall[0].item.order > cursorItem.order;
   }
 
+  /**
+   * Standby -re burns intro while waiting for promote — HLS window starts mid-episode.
+   * Cold-restart if burn exceeds cap before flip.
+   */
+  private async ensureStandbyFreshIntro(
+    slug: string,
+    tz: string,
+    profile: string,
+    channelKey: string,
+    standbySlot: StreamSlot,
+    priorEpisodeId: number | undefined,
+    job: FfmpegJob,
+  ): Promise<FfmpegJob | undefined> {
+    const maxBurn = Number(
+      this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 12),
+    );
+    const burn =
+      (job.offsetSec ?? 0) +
+      Math.max(0, (Date.now() - (job.startedAt ?? Date.now())) / 1000);
+    if (burn <= maxBurn || (job.offsetSec ?? 0) > 2) return job;
+    if (!priorEpisodeId) return job;
+
+    this.logger.warn(
+      `[${channelKey}] standby intro burn ${Math.round(burn)}s — cold restart before promote`,
+    );
+    try {
+      this.ffmpeg.stop(job.key);
+    } catch {
+      /* ignore */
+    }
+    this.ffmpeg.setStandbySlot(channelKey, undefined);
+    try {
+      await this.withChannelLock(channelKey, async () => {
+        await this.runEncode(slug, tz, profile, false, 'wall-clock', {
+          completedEpisodeIds: [priorEpisodeId],
+          asStandby: true,
+        });
+      });
+    } catch (e) {
+      this.logger.warn(
+        `[${channelKey}] standby intro restart failed: ${e instanceof Error ? e.message : e}`,
+      );
+      return undefined;
+    }
+    const slot = this.ffmpeg.getStandbySlot(channelKey) ?? standbySlot;
+    for (let i = 0; i < 28; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const j = this.ffmpeg.getBySlot(channelKey, slot);
+      if (j?.ready && this.ffmpeg.isJobAlive(j)) return j;
+    }
+    return this.ffmpeg.getBySlot(channelKey, slot);
+  }
+
   /** Flip active to standby slot and tell clients to switch playlist URL. */
-  async promoteStandby(slug: string, tz: string, profile: string): Promise<void> {
+  async promoteStandby(
+    slug: string,
+    tz: string,
+    profile: string,
+  ): Promise<'promoted' | 'deferred' | 'failed'> {
     const key = `${slug}:${tz}:${profile}`;
-    const standby = this.ffmpeg.getStandbySlot(key);
+    let standby = this.ffmpeg.getStandbySlot(key);
     if (!standby) {
       this.logger.warn(`[${key}] promoteStandby — no standby slot`);
-      return;
+      return 'failed';
     }
-    const job = this.ffmpeg.getBySlot(key, standby);
+    let job = this.ffmpeg.getBySlot(key, standby);
     if (!job || !this.ffmpeg.isJobAlive(job) || !job.ready) {
       this.logger.warn(`[${key}] promoteStandby — standby not ready`);
-      return;
+      // One soft retry — cold seek can finish shortly; do not wipe active.
+      const prev = this.standbyWatchTimers.get(key);
+      if (!prev) {
+        const t = setTimeout(() => {
+          this.standbyWatchTimers.delete(key);
+          void this.promoteStandby(slug, tz, profile);
+        }, 5_000);
+        this.standbyWatchTimers.set(key, t);
+      }
+      return 'failed';
     }
     const oldSlot = this.ffmpeg.getActiveSlot(key);
     const retiring = this.ffmpeg.getBySlot(key, oldSlot);
@@ -186,9 +257,9 @@ export class StreamEncodeService {
     const finish = await readAirFinish(channelDir);
     const priorItemId =
       finish?.scheduleItemId ?? retiring?.scheduleItemId ?? null;
-    // Short file / credits EOF while guide still in the slot (Rick post-credits
-    // cut → Primal). Do NOT promote early — and stop standby so it does not burn
-    // the next intro during the schedule pad.
+    // Short file / credits EOF while guide still in the slot (Rick post-credits).
+    // Do NOT promote early — but KEEP standby warm from episode start.
+    // Killing it used to force a later wall-clock /start into Kim ~50s in.
     if (priorItemId != null) {
       const past = await this.guidePastScheduleItem(slug, tz, priorItemId);
       if (!past) {
@@ -205,54 +276,86 @@ export class StreamEncodeService {
           airWindowStart,
           tz,
         );
-        const waitMs =
+        const waitMs = Math.max(
+          1_500,
           msUntilScheduleItemEnd(day?.scheduleItems, priorItemId, airStart) +
-          500;
-        const doneEp =
-          finish?.episodeId ?? retiring?.episodeId ?? job.episodeId;
+            400,
+        );
         this.logger.warn(
           `[${key}] promote deferred — guide still in item=${priorItemId} ` +
-            `(hold ~${Math.round(waitMs / 1000)}s, drop standby)`,
+            `(retry in ~${Math.round(waitMs / 1000)}s, freeze standby)`,
         );
-        // Kill warming next-ep so it does not burn intro during the pad.
-        if (job.process && !job.process.killed) {
-          try {
-            job.process.kill('SIGTERM');
-          } catch {
-            /* ignore */
-          }
+        // Standby -re from 0 during the whole hold burned Tom&Jerry intro (switch @ ~45s).
+        const doneEp =
+          retiring?.episodeId ?? finish?.episodeId ?? undefined;
+        try {
+          this.ffmpeg.stop(job.key);
+        } catch {
+          /* ignore */
         }
         this.ffmpeg.setStandbySlot(key, undefined);
-        this.ffmpeg.scheduleRetireSlot(key, standby, 0);
-        this.holdForWallCatchUp(
-          slug,
-          tz,
-          profile,
-          doneEp ? [doneEp] : [],
-          waitMs,
+        // Tell client we're between cartoons — keep last frame, no /start wipe.
+        this.realtime.emitHint(slug, 'wait', {
+          status: 'seam',
+          // Empty message → client stays silent if picture/last frame exists.
+        });
+        const prev = this.standbyWatchTimers.get(key);
+        if (prev) clearTimeout(prev);
+        const prepLeadMs = Math.min(
+          28_000,
+          Math.max(15_000, waitMs - 2_000),
         );
-        return;
+        const spawnDelayMs = Math.max(0, waitMs - prepLeadMs);
+        if (doneEp && spawnDelayMs >= 0) {
+          setTimeout(() => {
+            void this.spawnStandby(slug, tz, profile, {
+              completedEpisodeIds: [doneEp],
+            }).catch((e) =>
+              this.logger.warn(`[${key}] deferred standby respawn: ${e}`),
+            );
+          }, spawnDelayMs);
+        }
+        const t = setTimeout(() => {
+          this.standbyWatchTimers.delete(key);
+          void this.promoteStandby(slug, tz, profile);
+        }, waitMs);
+        this.standbyWatchTimers.set(key, t);
+        return 'deferred';
       }
+    }
+
+    const priorEp =
+      retiring?.episodeId ?? finish?.episodeId ?? undefined;
+    const freshJob = await this.ensureStandbyFreshIntro(
+      slug,
+      tz,
+      profile,
+      key,
+      standby,
+      priorEp,
+      job,
+    );
+    if (freshJob) job = freshJob;
+    standby = this.ffmpeg.getStandbySlot(key) ?? standby;
+    if (!this.ffmpeg.isJobAlive(job) || !job.ready) {
+      this.logger.warn(`[${key}] promoteStandby — standby not ready after intro check`);
+      return 'failed';
     }
 
     this.ffmpeg.setActiveSlot(key, standby);
     this.ffmpeg.setStandbySlot(key, undefined);
     this.clearSlotEndCatchUp(key);
     const gen = (finish?.generation ?? 0) + 1;
-    // Now commit cursor to the promoted episode (standby skipped writeAirFinish).
+    // Viewer starts at intro on switch — do not persist standby burn into cursor.
     if (job.episodeId && job.mediaPath && job.durationSec) {
-      const elapsed = Math.max(
-        0,
-        (Date.now() - (job.startedAt ?? Date.now())) / 1000,
-      );
       await writeAirFinish(channelDir, {
         date: calendarDateInTz(tz),
         episodeId: job.episodeId,
         scheduleItemId: job.scheduleItemId,
         mediaPath: job.mediaPath,
         relativePath: job.relativePath ?? '',
-        inpointSec: Math.floor((job.offsetSec ?? 0) + elapsed),
-        durationSec: Math.max(1, Math.floor(job.durationSec - elapsed)),
+        inpointSec: 0,
+        durationSec: Math.max(1, Math.floor(job.durationSec)),
         source: job.source ?? 'regular',
         policy: 'continuous',
         generation: gen,
@@ -333,10 +436,12 @@ export class StreamEncodeService {
       generation: gen,
       ready: true,
     });
-    // Retire old slot after clients have time to attach (was 25s — too short on early promote).
+    // Kill old encode + drop its m3u8 ASAP (keeps stale credits out of wrong-slot polls).
+    // Full .ts wipe ~8s — clients should already be on the new slot.
     if (oldSlot !== standby) {
-      this.ffmpeg.scheduleRetireSlot(key, oldSlot, 45_000);
+      this.ffmpeg.scheduleRetireSlot(key, oldSlot, 8_000);
     }
+    return 'promoted';
   }
 
   /** Poll until standby has .ts and active is near EOF (or dead), then promote. */
@@ -655,8 +760,14 @@ export class StreamEncodeService {
       const msg = e instanceof Error ? e.message : String(e);
       if (/air-grid-hold/i.test(msg)) outcome = 'hold';
       else {
+        // Transient encode/lock failure ≠ end of day — never push "закончен"
+        // (client treats that as permanent OFF AIR + black screen).
         this.logger.warn(`[${key}] continueEncode failed: ${msg}`);
-        outcome = 'off';
+        outcome = 'hold';
+        this.realtime.emitHint(slug, 'hard', {
+          status: 'seam',
+          message: 'Переподключаем эфир…',
+        });
       }
     }
     if (outcome === 'off') {

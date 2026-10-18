@@ -161,19 +161,29 @@ export class StreamRunEncodeService {
             this.businessValidation.assert(false, 'air-grid-hold');
           }
         } else {
-          const aligned = alignPlaylistHeadToWall(seq, wall);
-          if (aligned[0].inpointSec > 0) {
+          // Dual-slot standby: never wall-seek the next show — promote must
+          // deliver the intro (Jackie→Kim skipped ~50s when aligned mid-slot).
+          if (opts?.asStandby) {
             this.logger.log(
-              `[${slug}] sequential after ep=${seamIds.join(',')} → next=${aligned[0].item.episode?.id ?? aligned[0].item.episodeId}` +
-                ` +${aligned[0].inpointSec}s (wall mid-slot, ${aligned.length} left)`,
+              `[${slug}] standby sequential after ep=${seamIds.join(',')} → next=${seq[0].item.episode?.id ?? seq[0].item.episodeId} from 0 (${seq.length} left)`,
             );
+            all = seq;
+            usedSequential = true;
           } else {
-            this.logger.log(
-              `[${slug}] sequential after ep=${seamIds.join(',')} → next=${aligned[0].item.episode?.id ?? aligned[0].item.episodeId} (${aligned.length} left)`,
-            );
+            const aligned = alignPlaylistHeadToWall(seq, wall);
+            if (aligned[0].inpointSec > 0) {
+              this.logger.log(
+                `[${slug}] sequential after ep=${seamIds.join(',')} → next=${aligned[0].item.episode?.id ?? aligned[0].item.episodeId}` +
+                  ` +${aligned[0].inpointSec}s (wall mid-slot, ${aligned.length} left)`,
+              );
+            } else {
+              this.logger.log(
+                `[${slug}] sequential after ep=${seamIds.join(',')} → next=${aligned[0].item.episode?.id ?? aligned[0].item.episodeId} (${aligned.length} left)`,
+              );
+            }
+            all = aligned;
+            usedSequential = true;
           }
-          all = aligned;
-          usedSequential = true;
         }
       } else if (completedIds.length) {
         const done = new Set(completedIds);

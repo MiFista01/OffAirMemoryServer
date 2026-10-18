@@ -323,6 +323,28 @@ export class StreamService implements OnModuleDestroy {
           this.ffmpeg.touchChannel(key);
           return jobResponse(this.config, slug, existing);
         }
+        // Guide moved on — prefer promote over wipe (keeps intro at 0, no dual-slot kill).
+        const sb = this.ffmpeg.getStandbySlot(key);
+        const sbJob = sb ? this.ffmpeg.getBySlot(key, sb) : undefined;
+        if (sbJob && this.ffmpeg.isJobAlive(sbJob) && sbJob.ready) {
+          this.logger.warn(
+            `[${key}] /start near end + guidePast — promote standby (no wipe)`,
+          );
+          const outcome = await this.encode.promoteStandby(slug, tz, profile);
+          if (outcome === 'promoted') {
+            const promoted = this.ffmpeg.get(key);
+            if (promoted) {
+              promoted.lastAccessAt = Date.now();
+              this.ffmpeg.touchChannel(key);
+              return jobResponse(this.config, slug, promoted);
+            }
+          }
+          if (outcome === 'deferred') {
+            existing.lastAccessAt = Date.now();
+            this.ffmpeg.touchChannel(key);
+            return jobResponse(this.config, slug, existing);
+          }
+        }
         this.logger.warn(
           `[${key}] /start on live encode near end (≈${Math.round(remainLive)}s left) — advance`,
         );
@@ -588,7 +610,8 @@ export class StreamService implements OnModuleDestroy {
     const key = `${slug}:${tz}:${profile}`;
     const folderName = streamFolderName(slug, tz, profile);
     const job = this.ffmpeg.get(key);
-    const preparing = this.ffmpeg.isFolderPreparing(folderName);
+    // Active slot only — standby warm-up must not flash "Подключаем эфир…".
+    const preparing = this.ffmpeg.isActiveSlotPreparing(key, folderName);
     const finish = await readAirFinish(
       join(this.config.getOrThrow<string>('STREAM_ROOT').trim(), folderName),
     );
@@ -660,10 +683,7 @@ export class StreamService implements OnModuleDestroy {
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
     const folderName = streamFolderName(slug, tz, profile);
     const hlsDir = this.ffmpeg.activeHlsDir(streamRoot, folderName, key);
-    const preparing =
-      this.ffmpeg.isFolderPreparing(folderName) ||
-      this.ffmpeg.isFolderPreparing(`${folderName}/a`) ||
-      this.ffmpeg.isFolderPreparing(`${folderName}/b`);
+    const preparing = this.ffmpeg.isActiveSlotPreparing(key, folderName);
     const fresh = await this.ffmpeg.isPlaylistFresh(hlsDir);
     const status = await this.socketStatus(slug, tz, profile);
 
@@ -685,8 +705,8 @@ export class StreamService implements OnModuleDestroy {
     }
 
     if (fresh && status.ready) {
-      // Playlist is fine — do NOT hot-remanifest (causes short fragment restarts).
-      // Client keeps polling HLS; only hard if they are truly stuck with no buffer.
+      // Do NOT hint=switch on every sync — caused b→a ping-pong + /start fights.
+      // Wrong-slot recovery is play-issue playlist404 / promote emit only.
       const ok: StreamSocketStatus = {
         ...status,
         hint: 'none',
@@ -737,10 +757,7 @@ export class StreamService implements OnModuleDestroy {
     const dir = join(streamRoot, folderName);
     const job = this.ffmpeg.get(key);
     const hlsDir = job?.dir ?? this.ffmpeg.activeHlsDir(streamRoot, folderName, key);
-    const preparing =
-      this.ffmpeg.isFolderPreparing(folderName) ||
-      this.ffmpeg.isFolderPreparing(`${folderName}/a`) ||
-      this.ffmpeg.isFolderPreparing(`${folderName}/b`);
+    const preparing = this.ffmpeg.isActiveSlotPreparing(key, folderName);
 
     if (preparing) {
       const status = await this.socketStatus(slug, tz, profile);
@@ -764,14 +781,64 @@ export class StreamService implements OnModuleDestroy {
         this.encode.isBridgeEncodeJob(job) ||
         this.ffmpeg.getStandbySlot(key)
       ) {
-        const status = await this.socketStatus(slug, tz, profile);
-        status.hint = issue === 'buffering' ? 'none' : 'wait';
-        status.status = 'seam';
-        this.realtime.emitStatus(slug, status);
-        this.logger.log(
-          `[${key}] play-issue ${issue} during dual-slot seam — keep encode (hint=${status.hint})`,
-        );
-        return status;
+        const sb = this.ffmpeg.getStandbySlot(key);
+        const sbJob = sb ? this.ffmpeg.getBySlot(key, sb) : undefined;
+        const guidePast =
+          job.scheduleItemId == null ||
+          (await this.shouldCatchUpPastSlot(
+            slug,
+            tz,
+            job.scheduleItemId,
+            job.episodeId ?? 0,
+          ));
+        // End-slate freeze (CN logo) while guide already on next — promote/advance.
+        if (
+          sbJob &&
+          this.ffmpeg.isJobAlive(sbJob) &&
+          sbJob.ready &&
+          (issue === 'ended' || issue === 'stall' || guidePast)
+        ) {
+          this.logger.warn(
+            `[${key}] play-issue ${issue} — promote standby (guidePast=${guidePast})`,
+          );
+          const outcome = await this.encode
+            .promoteStandby(slug, tz, profile)
+            .catch((e) => {
+              this.logger.warn(`[${key}] promote on play-issue failed: ${e}`);
+              return 'failed' as const;
+            });
+          const status = await this.socketStatus(slug, tz, profile);
+          if (outcome === 'promoted') {
+            // Promote already emitted switch; reinforce with committed active URL.
+            status.hint = 'switch';
+            status.status = 'live';
+            status.streamUrl = status.streamUrl ?? sbJob.playlistUrl;
+            status.ready = true;
+            this.realtime.emitStatus(slug, status);
+            return status;
+          }
+          // Deferred/failed — keep last frame; do NOT point client at unpromoted URL.
+          status.hint = 'wait';
+          status.status = 'seam';
+          this.realtime.emitStatus(slug, status);
+          return status;
+        }
+        // Standby dead/missing but guide moved on — fall through to advance.
+        if (guidePast && (issue === 'ended' || issue === 'stall')) {
+          this.logger.warn(
+            `[${key}] play-issue ${issue} — guide past, standby unusable — advance`,
+          );
+          // fall through to near-end advance below
+        } else {
+          const status = await this.socketStatus(slug, tz, profile);
+          status.hint = issue === 'buffering' ? 'none' : 'wait';
+          status.status = 'seam';
+          this.realtime.emitStatus(slug, status);
+          this.logger.log(
+            `[${key}] play-issue ${issue} during dual-slot seam — keep encode (hint=${status.hint})`,
+          );
+          return status;
+        }
       }
 
       const nearEnd = this.encode.isJobNearEpisodeEnd(job);
@@ -871,6 +938,26 @@ export class StreamService implements OnModuleDestroy {
       // stall / ended with stale .ts → hard (frozen credits logo).
       const fresh = await this.ffmpeg.isPlaylistFresh(hlsDir);
       if (issue === 'playlist404' || !fresh) {
+        // After promote, client often still polls wiped slot a/ while live is b/.
+        // nginx maps missing m3u8 → 503 "preparing" — never leave them on wait without URL.
+        if (job.ready && job.playlistUrl) {
+          this.logger.warn(
+            `[${key}] play-issue ${issue} — active ready, push switch ${job.playlistUrl}`,
+          );
+          const sw: StreamSocketStatus = {
+            channel: slug,
+            status: 'live',
+            hint: 'switch',
+            episodeId: job.episodeId,
+            scheduleItemId: job.scheduleItemId,
+            ready: true,
+            streamUrl: job.playlistUrl,
+            slot: job.slot,
+            at: new Date().toISOString(),
+          };
+          this.realtime.emitStatus(slug, sw);
+          return sw;
+        }
         const wait: StreamSocketStatus = {
           channel: slug,
           status: 'seam',
@@ -898,6 +985,8 @@ export class StreamService implements OnModuleDestroy {
             episodeId: job.episodeId,
             scheduleItemId: job.scheduleItemId,
             ready: !!job.ready,
+            streamUrl: job.playlistUrl,
+            slot: job.slot,
             at: new Date().toISOString(),
             message: 'Переподключаем эфир…',
           };
