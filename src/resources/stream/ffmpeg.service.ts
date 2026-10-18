@@ -280,7 +280,7 @@ export class FfmpegService implements OnModuleDestroy {
 
   /**
    * Preparing for the ACTIVE slot only.
-   * Standby cold-seek must NOT make socket/seam report "Подключаем эфир…"
+   * Standby cold-seek must NOT make socket/seam report a connect chyron
    * while the live slot is still playing.
    */
   isActiveSlotPreparing(channelKey: string, channelFolder: string): boolean {

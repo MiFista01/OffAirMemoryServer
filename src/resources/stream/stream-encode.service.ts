@@ -427,7 +427,7 @@ export class StreamEncodeService {
       }
     }
     this.realtime.emitHint(slug, 'switch', {
-      // live + ready: client switches slots silently (no "эфир" chyron).
+      // live + ready: client switches slots silently (no connect chyron).
       status: 'live',
       streamUrl: job.playlistUrl,
       slot: standby,
@@ -748,7 +748,7 @@ export class StreamEncodeService {
     // Rolling resume / bridge — keep silent; client must not flash a TV chyron
     // while HLS buffer still plays the previous .ts.
     const silentSeam = !!opts?.resumeCursor || !!opts?.rolling;
-    // Do NOT emit "Подключаем эфир…" before we know the outcome — end-of-day
+    // Do NOT emit connect chyron before we know the outcome — end-of-day
     // continueEncode often returns off, and the early wait caused a chyron +
     // 503 storm while HLS was already being wiped.
     let outcome: 'live' | 'off' | 'hold' = 'live';
@@ -760,7 +760,7 @@ export class StreamEncodeService {
       const msg = e instanceof Error ? e.message : String(e);
       if (/air-grid-hold/i.test(msg)) outcome = 'hold';
       else {
-        // Transient encode/lock failure ≠ end of day — never push "закончен"
+        // Transient encode/lock failure ≠ end of day — never push "broadcast ended"
         // (client treats that as permanent OFF AIR + black screen).
         this.logger.warn(`[${key}] continueEncode failed: ${msg}`);
         outcome = 'hold';
@@ -1033,7 +1033,7 @@ export class StreamEncodeService {
             const wallEp =
               wall[0]?.item.episode?.id ?? wall[0]?.item.episodeId ?? -1;
             // Last file finished early while guide still in that slot — don't OFF AIR yet
-            // (Редакай кончился → off → reload restart). Hold until the slot ends.
+            // (Last row finished → off → reload restart). Hold until the slot ends.
             if (wall.length && seamDone.includes(wallEp)) {
               const waitMs = Math.max(3_000, (wall[0].durationSec || 1) * 1000);
               this.logger.log(

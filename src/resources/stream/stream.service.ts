@@ -610,7 +610,7 @@ export class StreamService implements OnModuleDestroy {
     const key = `${slug}:${tz}:${profile}`;
     const folderName = streamFolderName(slug, tz, profile);
     const job = this.ffmpeg.get(key);
-    // Active slot only — standby warm-up must not flash "Подключаем эфир…".
+    // Active slot only — standby warm-up must not flash a connect chyron.
     const preparing = this.ffmpeg.isActiveSlotPreparing(key, folderName);
     const finish = await readAirFinish(
       join(this.config.getOrThrow<string>('STREAM_ROOT').trim(), folderName),
@@ -632,7 +632,7 @@ export class StreamService implements OnModuleDestroy {
 
     if (job && this.ffmpeg.isJobAlive(job) && job.ready) {
       // Near EOF is handled by dual-slot switch hint — do NOT push hint=wait
-      // (client flashes "Почти готово…" / loading over a still-playing cartoon).
+      // (client flashes "almost ready" / loading over a still-playing cartoon).
       return {
         channel: slug,
         status: 'live',

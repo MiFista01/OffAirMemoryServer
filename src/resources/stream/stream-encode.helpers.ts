@@ -89,7 +89,7 @@ export function isJobNearEpisodeEnd(job: {
   return elapsed >= Math.max(0, windowSec - 25);
 }
 
-/** Alive multi-file concat (хвост A + начало B) — never kill via /start wall-clock. */
+/** Alive multi-file concat (tail of A + head of B) — never kill via /start wall-clock. */
 export function isBridgeEncodeJob(job: {
   segmentCount?: number;
   encodeWindowSec?: number;
