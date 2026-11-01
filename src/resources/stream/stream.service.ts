@@ -985,7 +985,7 @@ export class StreamService implements OnModuleDestroy {
             episodeId: job.episodeId,
             scheduleItemId: job.scheduleItemId,
             ready: !!job.ready,
-            streamUrl: job.playlistUrl,
+      streamUrl: job.playlistUrl,
             slot: job.slot,
             at: new Date().toISOString(),
             message: 'Переподключаем эфир…',

@@ -159,9 +159,14 @@ export async function startHlsUnlocked(
       host.clearPreparing(opts.folderName);
       throw e;
     }
-    child.stderr.on('data', (buf) =>
-      host.logger.warn(`[${opts.key}] ${buf.toString().trim()}`),
-    );
+    child.stderr.on('data', (buf) => {
+      const line = buf.toString().trim();
+      if (!line) return;
+      // Orphan sweep often deletes .ts a beat before ffmpeg delete_segments —
+      // noise only, not a stream fault.
+      if (/failed to delete old segment/i.test(line)) return;
+      host.logger.warn(`[${opts.key}] ${line}`);
+    });
     child.on('error', (err) => {
       host.logger.error(`[${opts.key}] spawn failed: ${err.message}`);
       host.jobs.delete(opts.key);

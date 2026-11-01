@@ -595,13 +595,25 @@ export class StreamRunEncodeService {
               ? await host.guidePastScheduleItem?.(slug, tz, first.item.id)
               : true;
             if (past === false) {
+              // Do NOT rolling-resume credits — that restarts the ending until the
+              // guide catches up (client remanifest = visible rollback).
               this.logger.warn(
-                `[${slug}] near-EOF stall but guide still in slot — resume (keep ending)`,
+                `[${slug}] near-EOF stall but guide still in slot — hold (no credits re-encode)`,
               );
-              void host.continueEncode(slug, tz, profile, {
-                resumeCursor: true,
-                rolling: true,
-              });
+              const waitMs = Math.max(
+                3_000,
+                msUntilScheduleItemEnd(items, first.item.id, airStart) + 400,
+              );
+              const doneId = firstEp?.id;
+              if (doneId) {
+                host.holdForWallCatchUp(
+                  slug,
+                  tz,
+                  profile,
+                  [doneId],
+                  waitMs,
+                );
+              }
               return;
             }
             this.logger.warn(

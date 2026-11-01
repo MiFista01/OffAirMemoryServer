@@ -429,6 +429,9 @@ export class FfmpegService implements OnModuleDestroy {
     return stopped;
   }
 
+  /** Orphan .ts sweep cadence — every N idle ticks (15s × 4 = 60s). */
+  private orphanSweepTick = 0;
+
   @Interval(15_000)
   reapIdleJobs() {
     const ttlSec = Number(
@@ -436,8 +439,10 @@ export class FfmpegService implements OnModuleDestroy {
     );
     const ttl = Number.isFinite(ttlSec) && ttlSec > 0 ? ttlSec : STREAM_IDLE_TTL_SEC;
     const cutoff = Date.now() - ttl * 1000;
+    this.orphanSweepTick = (this.orphanSweepTick + 1) % 4;
+    const doSweep = this.orphanSweepTick === 0;
     for (const [key, job] of this.jobs) {
-      if (this.isAlive(job)) {
+      if (doSweep && this.isAlive(job)) {
         void sweepOrphanSegments(this.logger, job.dir).catch(() => undefined);
       }
       if (job.lastAccessAt >= cutoff) continue;

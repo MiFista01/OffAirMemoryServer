@@ -54,6 +54,13 @@ export class StreamEncodeService {
   private readonly aheadHoldTimers = new Map<string, NodeJS.Timeout>();
   /** Active encode past its grid slot — catch up without waiting for F5. */
   private readonly slotEndTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Guide still in prior slot — single promote retry. Must NOT share
+   * standbyWatchTimers (watch loop used to clear the defer timer → kill/respawn storm).
+   */
+  private readonly promoteDeferTimers = new Map<string, NodeJS.Timeout>();
+  /** Long-hold only: one standby respawn near promote time. */
+  private readonly promoteDeferSpawnTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly config: ConfigService,
@@ -105,6 +112,15 @@ export class StreamEncodeService {
 
   private readonly standbyWatchTimers = new Map<string, NodeJS.Timeout>();
 
+  private clearPromoteDefer(key: string): void {
+    const t = this.promoteDeferTimers.get(key);
+    if (t) clearTimeout(t);
+    this.promoteDeferTimers.delete(key);
+    const s = this.promoteDeferSpawnTimers.get(key);
+    if (s) clearTimeout(s);
+    this.promoteDeferSpawnTimers.delete(key);
+  }
+
   /**
    * Dual-slot: encode the next owed episode into the inactive slot while
    * the active ffmpeg keeps serving the current cartoon.
@@ -123,7 +139,10 @@ export class StreamEncodeService {
       );
       if (existing && this.ffmpeg.isJobAlive(existing)) {
         this.logger.log(`[${key}] standby already warming — skip spawn`);
-        void this.watchStandbyPromote(slug, tz, profile);
+        // Defer timer owns the next promote — do not restart the watch loop.
+        if (!this.promoteDeferTimers.has(key)) {
+          void this.watchStandbyPromote(slug, tz, profile);
+        }
         return;
       }
     }
@@ -258,11 +277,14 @@ export class StreamEncodeService {
     const priorItemId =
       finish?.scheduleItemId ?? retiring?.scheduleItemId ?? null;
     // Short file / credits EOF while guide still in the slot (Rick post-credits).
-    // Do NOT promote early — but KEEP standby warm from episode start.
-    // Killing it used to force a later wall-clock /start into Kim ~50s in.
+    // Do NOT promote early. Short holds: KEEP standby warm (no kill/respawn storm).
+    // Long holds: freeze once and respawn near promote — never every 2–4s.
     if (priorItemId != null) {
       const past = await this.guidePastScheduleItem(slug, tz, priorItemId);
       if (!past) {
+        if (this.promoteDeferTimers.has(key)) {
+          return 'deferred';
+        }
         const channel = await this.channels.findOne({ slug, isActive: true });
         const day = channel
           ? await this.loadScheduleDay(channel.id, tz)
@@ -281,48 +303,71 @@ export class StreamEncodeService {
           msUntilScheduleItemEnd(day?.scheduleItems, priorItemId, airStart) +
             400,
         );
-        this.logger.warn(
-          `[${key}] promote deferred — guide still in item=${priorItemId} ` +
-            `(retry in ~${Math.round(waitMs / 1000)}s, freeze standby)`,
+        const maxBurnSec = Number(
+          this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 12),
         );
-        // Standby -re from 0 during the whole hold burned Tom&Jerry intro (switch @ ~45s).
+        // Keep living standby if hold fits under burn budget (+slack).
+        const keepWarmMs = Math.max(20_000, (maxBurnSec + 8) * 1000);
         const doneEp =
           retiring?.episodeId ?? finish?.episodeId ?? undefined;
-        try {
-          this.ffmpeg.stop(job.key);
-        } catch {
-          /* ignore */
-        }
-        this.ffmpeg.setStandbySlot(key, undefined);
-        // Tell client we're between cartoons — keep last frame, no /start wipe.
+
+        // Stop the watch loop — it shared standbyWatchTimers and cleared defer.
+        const prevWatch = this.standbyWatchTimers.get(key);
+        if (prevWatch) clearTimeout(prevWatch);
+        this.standbyWatchTimers.delete(key);
+
         this.realtime.emitHint(slug, 'wait', {
           status: 'seam',
-          // Empty message → client stays silent if picture/last frame exists.
         });
-        const prev = this.standbyWatchTimers.get(key);
-        if (prev) clearTimeout(prev);
-        const prepLeadMs = Math.min(
-          28_000,
-          Math.max(15_000, waitMs - 2_000),
-        );
-        const spawnDelayMs = Math.max(0, waitMs - prepLeadMs);
-        if (doneEp && spawnDelayMs >= 0) {
-          setTimeout(() => {
-            void this.spawnStandby(slug, tz, profile, {
-              completedEpisodeIds: [doneEp],
-            }).catch((e) =>
-              this.logger.warn(`[${key}] deferred standby respawn: ${e}`),
-            );
-          }, spawnDelayMs);
+
+        if (waitMs > keepWarmMs) {
+          this.logger.warn(
+            `[${key}] promote deferred — guide still in item=${priorItemId} ` +
+              `(retry in ~${Math.round(waitMs / 1000)}s, freeze+respawn once)`,
+          );
+          try {
+            this.ffmpeg.stop(job.key);
+          } catch {
+            /* ignore */
+          }
+          this.ffmpeg.setStandbySlot(key, undefined);
+          const prepLeadMs = Math.min(
+            28_000,
+            Math.max(15_000, waitMs - 2_000),
+          );
+          const spawnDelayMs = Math.max(0, waitMs - prepLeadMs);
+          if (doneEp) {
+            const st = setTimeout(() => {
+              this.promoteDeferSpawnTimers.delete(key);
+              void this.spawnStandby(slug, tz, profile, {
+                completedEpisodeIds: [doneEp],
+              }).catch((e) =>
+                this.logger.warn(`[${key}] deferred standby respawn: ${e}`),
+              );
+            }, spawnDelayMs);
+            this.promoteDeferSpawnTimers.set(key, st);
+          }
+        } else {
+          this.logger.warn(
+            `[${key}] promote deferred — guide still in item=${priorItemId} ` +
+              `(retry in ~${Math.round(waitMs / 1000)}s, keep standby warm)`,
+          );
         }
+
         const t = setTimeout(() => {
-          this.standbyWatchTimers.delete(key);
-          void this.promoteStandby(slug, tz, profile);
+          this.promoteDeferTimers.delete(key);
+          void this.promoteStandby(slug, tz, profile).then((outcome) => {
+            if (outcome === 'failed' || outcome === 'deferred') {
+              void this.watchStandbyPromote(slug, tz, profile);
+            }
+          });
         }, waitMs);
-        this.standbyWatchTimers.set(key, t);
+        this.promoteDeferTimers.set(key, t);
         return 'deferred';
       }
     }
+
+    this.clearPromoteDefer(key);
 
     const priorEp =
       retiring?.episodeId ?? finish?.episodeId ?? undefined;
@@ -447,12 +492,15 @@ export class StreamEncodeService {
   /** Poll until standby has .ts and active is near EOF (or dead), then promote. */
   watchStandbyPromote(slug: string, tz: string, profile: string): void {
     const key = `${slug}:${tz}:${profile}`;
+    // Guide-hold owns the next promote — do not fight its timer.
+    if (this.promoteDeferTimers.has(key)) return;
     const prev = this.standbyWatchTimers.get(key);
     if (prev) clearTimeout(prev);
 
     let tries = 0;
     const tick = () => {
       this.standbyWatchTimers.delete(key);
+      if (this.promoteDeferTimers.has(key)) return;
       const standby = this.ffmpeg.getStandbySlot(key);
       if (!standby) return;
       const standbyJob = this.ffmpeg.getBySlot(key, standby);
@@ -483,7 +531,13 @@ export class StreamEncodeService {
         this.standbyWatchTimers.set(key, t);
         return;
       }
-      void this.promoteStandby(slug, tz, profile);
+      void this.promoteStandby(slug, tz, profile).then((outcome) => {
+        // deferred: promoteDeferTimers owns retry. failed: soft re-watch.
+        if (outcome === 'failed' && tries < 90) {
+          const t = setTimeout(tick, 2_000);
+          this.standbyWatchTimers.set(key, t);
+        }
+      });
     };
     const t = setTimeout(tick, 2_000);
     this.standbyWatchTimers.set(key, t);
@@ -712,6 +766,7 @@ export class StreamEncodeService {
     this.logger.log(`[${key}] end of air — stop + clear HLS (both slots)`);
     this.clearAheadHold(key);
     this.clearSlotEndCatchUp(key);
+    this.clearPromoteDefer(key);
     const watch = this.standbyWatchTimers.get(key);
     if (watch) clearTimeout(watch);
     this.standbyWatchTimers.delete(key);
@@ -725,7 +780,7 @@ export class StreamEncodeService {
     // Clear channel root + both slot dirs
     await this.ffmpeg.clearHlsFolder(join(dir, 'a'));
     await this.ffmpeg.clearHlsFolder(join(dir, 'b'));
-    await this.ffmpeg.clearHlsFolder(dir);
+      await this.ffmpeg.clearHlsFolder(dir);
     await clearAirFinish(dir);
   }
 
@@ -754,8 +809,8 @@ export class StreamEncodeService {
     let outcome: 'live' | 'off' | 'hold' = 'live';
     try {
       outcome = await this.withChannelLock(key, () =>
-        this.continueEncodeUnlocked(slug, tz, profile, opts),
-      );
+      this.continueEncodeUnlocked(slug, tz, profile, opts),
+    );
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (/air-grid-hold/i.test(msg)) outcome = 'hold';
@@ -886,7 +941,9 @@ export class StreamEncodeService {
 
       if (opts?.resumeCursor && finish) {
         // Crash / mid-episode resume — re-encode same tail into the active slot (no concat bridge).
-        if (opts.rolling) {
+        // Short leftover must NOT take this path: rolling used to bypass the
+        // credits guard below → ending replay / tech-time crawl / hot-recover loop.
+        if (opts.rolling && finish.durationSec > 120) {
           this.logger.log(
             `[${key}] rolling resume ep=${finish.episodeId} rem≈${Math.round(finish.durationSec)}s (dual-slot, no bridge)`,
           );
@@ -1043,10 +1100,10 @@ export class StreamEncodeService {
               return 'hold';
             }
             if (!wall.length) {
-              this.logger.log(
-                `[${key}] end of schedule after ep=${seamDone.join(',')} → off air`,
-              );
-              await this.shutdownChannelStream(slug, tz, profile);
+            this.logger.log(
+              `[${key}] end of schedule after ep=${seamDone.join(',')} → off air`,
+            );
+            await this.shutdownChannelStream(slug, tz, profile);
               return 'off';
             }
             // Guide already elsewhere — fall through to runEncode (wall/seq).
@@ -1344,20 +1401,48 @@ export class StreamEncodeService {
               finish.scheduleItemId,
             );
             if (!past) {
+              // Re-encoding credits while the guide holds the slot = end→rollback loop.
               this.logger.warn(
-                `[${key}] finish near-EOF stall but guide still in slot — resume`,
+                `[${key}] finish near-EOF stall but guide still in slot — hold`,
               );
-              void this.continueEncode(slug, tz, profile, {
-                resumeCursor: true,
-                rolling: true,
+              const channel = await this.channels.findOne({
+                slug,
+                isActive: true,
               });
+              const day = channel
+                ? await this.loadScheduleDay(channel.id, tz)
+                : null;
+              const airWindowStart = this.config.get<string>(
+                'AIR_WINDOW_START',
+                AIR_WINDOW_START,
+              );
+              const airStart = windowStartAt(
+                calendarDateInTz(tz),
+                airWindowStart,
+                tz,
+              );
+              const waitMs = Math.max(
+                3_000,
+                msUntilScheduleItemEnd(
+                  day?.scheduleItems,
+                  finish.scheduleItemId,
+                  airStart,
+                ) + 400,
+              );
+              this.holdForWallCatchUp(
+                slug,
+                tz,
+                profile,
+                [finish.episodeId],
+                waitMs,
+              );
               return;
             }
           }
-          void this.continueEncode(slug, tz, profile, {
-            skipCurrent: nearEnd,
-            completedEpisodeIds: nearEnd ? [finish.episodeId] : undefined,
-          });
+        void this.continueEncode(slug, tz, profile, {
+          skipCurrent: nearEnd,
+          completedEpisodeIds: nearEnd ? [finish.episodeId] : undefined,
+        });
         })();
       },
     });
