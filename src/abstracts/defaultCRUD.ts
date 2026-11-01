@@ -107,12 +107,8 @@ export abstract class DefaultCRUDService<
         continue;
       }
 
-      if (typeof v === 'string') {
-        base[k] = keyWithoutLike.includes(k)
-          ? v
-          : Like(`%${this.escapeLike(v)}%`);
-        continue;
-      }
+      // Operators before string→Like — otherwise {'date<': '2026-01-01'} becomes
+      // Like on a fake field "date<" and TypeORM throws EntityPropertyNotFoundError.
       const operatorMatch = k.match(/^(.+?)([<>]=?)$/);
       if (operatorMatch) {
         const [, fieldName, operator] = operatorMatch;
@@ -123,6 +119,13 @@ export abstract class DefaultCRUDService<
           base[fieldName] = this.comparisonOperators[operator](v);
           continue;
         }
+      }
+
+      if (typeof v === 'string') {
+        base[k] = keyWithoutLike.includes(k)
+          ? v
+          : Like(`%${this.escapeLike(v)}%`);
+        continue;
       }
       base[k] = v;
     }
