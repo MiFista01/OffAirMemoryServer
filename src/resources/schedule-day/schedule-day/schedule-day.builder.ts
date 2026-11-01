@@ -25,6 +25,13 @@ export function todayUtcDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Shift YYYY-MM-DD by whole calendar days (UTC date parts — fine for air dates). */
+export function shiftYmd(ymd: string, deltaDays: number): string {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return dt.toISOString().slice(0, 10);
+}
+
 export function scheduleSeed(channelId: number, date: string): number {
   let h = 2166136261 ^ channelId;
   for (let i = 0; i < date.length; i++) {

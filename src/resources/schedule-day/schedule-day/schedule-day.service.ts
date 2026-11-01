@@ -11,7 +11,11 @@ import { ChannelsService } from 'src/resources/channels/channels/channels.servic
 import { CartoonService } from 'src/resources/channels/cartoon/cartoon.service';
 import { AIR_TIME_HOURS, AIR_WINDOW_START } from '@constants';
 import { ScheduleItemService } from '../schedule-item/schedule-item.service';
-import { buildDayPlaylist, todayUtcDate } from './schedule-day.builder';
+import {
+  buildDayPlaylist,
+  shiftYmd,
+  todayUtcDate,
+} from './schedule-day.builder';
 import { AirHistoryService } from 'src/resources/air-history/air-history.service';
 import {
   calendarDateInTz,
@@ -161,6 +165,7 @@ export class ScheduleDayService
       this.logger.warn(
         `createDaySchedule(${date}): no active channels — activate channels/cartoons after scan`,
       );
+      await this.purgeOldScheduleDays();
       return { date, channels: 0, created: 0 };
     }
 
@@ -172,7 +177,30 @@ export class ScheduleDayService
     this.logger.log(
       `createDaySchedule(${date}): activeChannels=${channels.length} daysCreated=${created}`,
     );
-    return { date, channels: channels.length, created };
+    // New day is additive — old days stay until purged (guide only loads today).
+    const purged = await this.purgeOldScheduleDays();
+    return { date, channels: channels.length, created, purged };
+  }
+
+  /**
+   * Drop schedule days older than keepDays (default 7) before today in AIR_TZ.
+   * createDaySchedule only inserts missing today — it never replaces history.
+   */
+  async purgeOldScheduleDays(keepDays = 7): Promise<number> {
+    const tz = this.config.get<string>('AIR_TZ', 'Europe/Tallinn');
+    const today = calendarDateInTz(tz);
+    const keep = Math.max(1, Math.floor(keepDays));
+    const cutoff = shiftYmd(today, -keep);
+    const oldDays = await this.findAllBySearch({ 'date<': cutoff });
+    if (!oldDays.length) return 0;
+
+    const dayIds = oldDays.map((d) => d.id);
+    await this.scheduleItemService.remove({ scheduleDayId: dayIds });
+    await this.remove({ id: dayIds });
+    this.logger.log(
+      `purgeOldScheduleDays: removed ${dayIds.length} day(s) before ${cutoff} (keep ${keep}d)`,
+    );
+    return dayIds.length;
   }
 
   /**
