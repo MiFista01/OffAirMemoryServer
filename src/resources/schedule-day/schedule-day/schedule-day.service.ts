@@ -4,7 +4,7 @@ import { CreateScheduleDayDto } from './dto/create-schedule-day.dto';
 import { UpdateScheduleDayDto } from './dto/update-schedule-day.dto';
 import { DefaultCRUDService } from 'src/abstracts/defaultCRUD';
 import { ScheduleDay } from '@entities';
-import { Repository } from 'typeorm';
+import { LessThan, Repository } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ChannelsService } from 'src/resources/channels/channels/channels.service';
@@ -165,7 +165,11 @@ export class ScheduleDayService
       this.logger.warn(
         `createDaySchedule(${date}): no active channels — activate channels/cartoons after scan`,
       );
-      await this.purgeOldScheduleDays();
+      try {
+        await this.purgeOldScheduleDays();
+      } catch (e) {
+        this.logger.warn(`purgeOldScheduleDays failed: ${e}`);
+      }
       return { date, channels: 0, created: 0 };
     }
 
@@ -178,7 +182,12 @@ export class ScheduleDayService
       `createDaySchedule(${date}): activeChannels=${channels.length} daysCreated=${created}`,
     );
     // New day is additive — old days stay until purged (guide only loads today).
-    const purged = await this.purgeOldScheduleDays();
+    let purged = 0;
+    try {
+      purged = await this.purgeOldScheduleDays();
+    } catch (e) {
+      this.logger.warn(`purgeOldScheduleDays failed: ${e}`);
+    }
     return { date, channels: channels.length, created, purged };
   }
 
@@ -191,7 +200,11 @@ export class ScheduleDayService
     const today = calendarDateInTz(tz);
     const keep = Math.max(1, Math.floor(keepDays));
     const cutoff = shiftYmd(today, -keep);
-    const oldDays = await this.findAllBySearch({ 'date<': cutoff });
+    // LessThan directly — DefaultCRUD turns string values into Like before 'date<' ops.
+    const oldDays = await this.getRepo().find({
+      where: { date: LessThan(cutoff) },
+      select: ['id'],
+    });
     if (!oldDays.length) return 0;
 
     const dayIds = oldDays.map((d) => d.id);
