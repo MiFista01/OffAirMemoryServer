@@ -13,6 +13,7 @@ import { Public } from '@decorators';
 import { Server, Socket } from 'socket.io';
 import { StreamRealtimeService } from './stream-realtime.service';
 import { StreamService } from './stream.service';
+import { ConfigService } from '@nestjs/config';
 
 type JoinBody = {
   slug?: string;
@@ -41,7 +42,13 @@ export class StreamGateway implements OnGatewayInit {
   constructor(
     private readonly realtime: StreamRealtimeService,
     private readonly stream: StreamService,
+    private readonly config: ConfigService,
   ) {}
+
+  /** Station air TZ — ignore browser tz so all viewers share one encode key. */
+  private airTz(): string {
+    return this.config.get<string>('AIR_TZ', 'Europe/Tallinn');
+  }
 
   afterInit(server: Server) {
     this.realtime.attach(server);
@@ -55,7 +62,7 @@ export class StreamGateway implements OnGatewayInit {
   ) {
     const slug = body?.slug?.trim();
     if (!slug) return { ok: false, error: 'slug required' };
-    const tz = body.tz?.trim() || 'Europe/Tallinn';
+    const tz = this.airTz();
     const profile = body.profile?.trim() || '720p';
     const room = `stream:${slug}`;
     await client.join(room);
@@ -83,7 +90,7 @@ export class StreamGateway implements OnGatewayInit {
   ) {
     const slug = body?.slug?.trim();
     if (!slug || !body.issue) return { ok: false, error: 'slug+issue required' };
-    const tz = body.tz?.trim() || 'Europe/Tallinn';
+    const tz = this.airTz();
     const profile = body.profile?.trim() || '720p';
     const result = await this.stream.resolvePlayIssue(
       slug,
@@ -103,7 +110,7 @@ export class StreamGateway implements OnGatewayInit {
   ) {
     const slug = body?.slug?.trim();
     if (!slug) return { ok: false, error: 'slug required' };
-    const tz = body.tz?.trim() || 'Europe/Tallinn';
+    const tz = this.airTz();
     const profile = body.profile?.trim() || '720p';
     const status = await this.stream.resolveSeamSync(slug, tz, profile);
     client.emit('stream:status', status);

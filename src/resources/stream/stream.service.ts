@@ -862,7 +862,9 @@ export class StreamService implements OnModuleDestroy {
             job.scheduleItemId,
             job.episodeId ?? 0,
           ));
-        if (!guidePast && remain > 12 && issue !== 'ended') {
+        // Including issue=ended: client media ended early (credits) while
+        // guide still owns the slot — do not skip ahead of the grid.
+        if (!guidePast && remain > 12) {
           const status = await this.socketStatus(slug, tz, profile);
           status.hint = 'wait';
           status.status = 'seam';
@@ -1050,6 +1052,7 @@ export class StreamService implements OnModuleDestroy {
 
   stop(slug: string, tz = 'Europe/Tallinn', profile = '720p') {
     const key = `${slug}:${tz}:${profile}`;
+    this.encode.cancelChannelTimers(key);
     this.ffmpeg.stopChannel(key);
     return { channel: slug, key, stopped: true };
   }
@@ -1264,17 +1267,19 @@ export class StreamService implements OnModuleDestroy {
         };
       } catch (e) {
         this.logger.warn(`[${key}] status ensure start failed: ${e}`);
+        // Do NOT map transient start failures to "off" — client treats that as
+        // end-of-day and disables reconnect forever.
         return {
           channel: slug,
           key,
           alive: false,
           ready: false,
           playable: false,
-          status: 'off' as const,
+          status: 'idle' as const,
           streamUrl: null as string | null,
           ageSec: null as number | null,
-          pollAfterMs: undefined as number | undefined,
-          message: 'Сейчас не в эфире',
+          pollAfterMs: 2000,
+          message: 'Эфир есть, подготавливаем поток — подождите',
         };
       }
     }

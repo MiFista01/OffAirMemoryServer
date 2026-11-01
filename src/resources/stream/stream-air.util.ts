@@ -223,8 +223,16 @@ export function findPlaylistAfterCompleted(
     }
   }
   if (lastIdx < 0) {
-    for (let i = 0; i < sorted.length; i++) {
-      if (done.has(epIdOf(sorted[i]))) lastIdx = i;
+    // No scheduleItem hint — take the FIRST match, then extend through a
+    // contiguous run of completed ids. Using the LAST match skipped middle
+    // slots when the same episodeId airs twice in one day.
+    const firstIdx = sorted.findIndex((i) => done.has(epIdOf(i)));
+    if (firstIdx >= 0) {
+      lastIdx = firstIdx;
+      for (let i = firstIdx; i < sorted.length; i++) {
+        if (done.has(epIdOf(sorted[i]))) lastIdx = i;
+        else break;
+      }
     }
   }
   if (lastIdx < 0 || lastIdx >= sorted.length - 1) return null;

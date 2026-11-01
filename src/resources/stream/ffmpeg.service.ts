@@ -303,10 +303,12 @@ export class FfmpegService implements OnModuleDestroy {
     rollingHandoff?: boolean;
     /** Already retried without append — do not loop. */
     _freshRetry?: boolean;
-    onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
+    onNaturalEnd?: (
+      meta: { rolling: boolean },
+    ) => void | Promise<void | unknown>;
     onStallEnd?: () => void | Promise<void>;
     /** Dual-slot: spawn next encode in the other slot ~bridgeSec before EOF (no kill). */
-    onStandbyPrep?: () => void | Promise<void>;
+    onStandbyPrep?: () => void | Promise<void | unknown>;
     slot?: 'a' | 'b';
     channelKey?: string;
   }): Promise<FfmpegJob> {

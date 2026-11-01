@@ -48,10 +48,12 @@ export async function startHlsUnlocked(
     append?: boolean;
     rollingHandoff?: boolean;
     _freshRetry?: boolean;
-    onNaturalEnd?: (meta: { rolling: boolean }) => void | Promise<void>;
+    onNaturalEnd?: (
+      meta: { rolling: boolean },
+    ) => void | Promise<void | unknown>;
     onStallEnd?: () => void | Promise<void>;
     /** Dual-slot: prep next cartoon without killing this encode. */
-    onStandbyPrep?: () => void | Promise<void>;
+    onStandbyPrep?: () => void | Promise<void | unknown>;
     slot?: 'a' | 'b';
     channelKey?: string;
   }): Promise<FfmpegJob> {

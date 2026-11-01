@@ -61,6 +61,8 @@ export class StreamEncodeService {
   private readonly promoteDeferTimers = new Map<string, NodeJS.Timeout>();
   /** Long-hold only: one standby respawn near promote time. */
   private readonly promoteDeferSpawnTimers = new Map<string, NodeJS.Timeout>();
+  /** Cap soft retries when standby playlist is not ready yet. */
+  private readonly promoteNotReadyRetries = new Map<string, number>();
 
   constructor(
     private readonly config: ConfigService,
@@ -163,7 +165,9 @@ export class StreamEncodeService {
         this.logger.log(`[${key}] standby spawn held — skip warm`);
         return;
       }
-      throw e;
+      // Never throw from fire-and-forget standby prep — unhandledRejection kills Nest.
+      this.logger.warn(`[${key}] standby spawn failed: ${msg}`);
+      this.ffmpeg.setStandbySlot(key, undefined);
     }
   }
 
@@ -203,8 +207,9 @@ export class StreamEncodeService {
     priorEpisodeId: number | undefined,
     job: FfmpegJob,
   ): Promise<FfmpegJob | undefined> {
+    // Must be ≥ standby prepLead (~30–40s) or every seam cold-restarts B.
     const maxBurn = Number(
-      this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 12),
+      this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 45),
     );
     const burn =
       (job.offsetSec ?? 0) +
@@ -222,16 +227,17 @@ export class StreamEncodeService {
     }
     this.ffmpeg.setStandbySlot(channelKey, undefined);
     try {
-      await this.withChannelLock(channelKey, async () => {
-        await this.runEncode(slug, tz, profile, false, 'wall-clock', {
-          completedEpisodeIds: [priorEpisodeId],
-          asStandby: true,
-        });
+      // Do NOT take withChannelLock here — /start and promote already hold it
+      // (re-entrant wait = permanent channel deadlock).
+      await this.runEncode(slug, tz, profile, false, 'wall-clock', {
+        completedEpisodeIds: [priorEpisodeId],
+        asStandby: true,
       });
     } catch (e) {
       this.logger.warn(
         `[${channelKey}] standby intro restart failed: ${e instanceof Error ? e.message : e}`,
       );
+      this.ffmpeg.setStandbySlot(channelKey, undefined);
       return undefined;
     }
     const slot = this.ffmpeg.getStandbySlot(channelKey) ?? standbySlot;
@@ -257,18 +263,49 @@ export class StreamEncodeService {
     }
     let job = this.ffmpeg.getBySlot(key, standby);
     if (!job || !this.ffmpeg.isJobAlive(job) || !job.ready) {
-      this.logger.warn(`[${key}] promoteStandby — standby not ready`);
-      // One soft retry — cold seek can finish shortly; do not wipe active.
-      const prev = this.standbyWatchTimers.get(key);
-      if (!prev) {
+      const attempts = this.promoteNotReadyRetries.get(key) ?? 0;
+      this.logger.warn(
+        `[${key}] promoteStandby — standby not ready (attempt ${attempts + 1}/6)`,
+      );
+      // Soft retries — cold seek can finish shortly; do not wipe active.
+      // Cap at 6 (~30s) so a dead standby cannot loop forever every 5s.
+      if (attempts < 6 && !this.standbyWatchTimers.has(key)) {
+        this.promoteNotReadyRetries.set(key, attempts + 1);
         const t = setTimeout(() => {
           this.standbyWatchTimers.delete(key);
           void this.promoteStandby(slug, tz, profile);
         }, 5_000);
         this.standbyWatchTimers.set(key, t);
+      } else if (attempts >= 6) {
+        this.promoteNotReadyRetries.delete(key);
+        this.logger.warn(
+          `[${key}] promoteStandby — give up not-ready; clear standby + continue`,
+        );
+        this.ffmpeg.setStandbySlot(key, undefined);
+        // Active may already be dead (naturalEnd → promote). Restart air.
+        // Prefer active/finish ep — never standby's episodeId (that is "next").
+        const active = this.ffmpeg.getActive(key);
+        const streamRoot = this.config
+          .getOrThrow<string>('STREAM_ROOT')
+          .trim();
+        const channelDir = join(
+          streamRoot,
+          streamFolderName(slug, tz, profile),
+        );
+        const finish = await readAirFinish(channelDir);
+        const doneEp =
+          active?.episodeId ?? finish?.episodeId ?? undefined;
+        void this.continueEncode(slug, tz, profile, {
+          completedEpisodeIds: doneEp ? [doneEp] : [],
+        }).catch((e) =>
+          this.logger.warn(
+            `[${key}] continue after promote give-up: ${e instanceof Error ? e.message : e}`,
+          ),
+        );
       }
       return 'failed';
     }
+    this.promoteNotReadyRetries.delete(key);
     const oldSlot = this.ffmpeg.getActiveSlot(key);
     const retiring = this.ffmpeg.getBySlot(key, oldSlot);
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
@@ -304,7 +341,7 @@ export class StreamEncodeService {
             400,
         );
         const maxBurnSec = Number(
-          this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 12),
+          this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 45),
         );
         // Keep living standby if hold fits under burn budget (+slack).
         const keepWarmMs = Math.max(20_000, (maxBurnSec + 8) * 1000);
@@ -604,6 +641,17 @@ export class StreamEncodeService {
     }
   }
 
+  /** Clear all deferred/watch timers for a channel (stop / shutdown). */
+  cancelChannelTimers(key: string): void {
+    this.clearAheadHold(key);
+    this.clearSlotEndCatchUp(key);
+    this.clearPromoteDefer(key);
+    const watch = this.standbyWatchTimers.get(key);
+    if (watch) clearTimeout(watch);
+    this.standbyWatchTimers.delete(key);
+    this.promoteNotReadyRetries.delete(key);
+  }
+
   /**
    * Fire when the guide leaves `scheduleItemId`. If we are still encoding that
    * row, stop and jump to wall-clock (same as F5 /start catch-up).
@@ -643,7 +691,9 @@ export class StreamEncodeService {
     const key = `${slug}:${tz}:${profile}`;
     const job = this.ffmpeg.getActive(key);
     if (!job || !this.ffmpeg.isJobAlive(job)) return;
-    if (job.scheduleItemId !== scheduleItemId && job.episodeId !== episodeId) {
+    // Both must still match — otherwise a timer for ep X item A can kill
+    // a later airing of the same episode under a different schedule item.
+    if (job.scheduleItemId !== scheduleItemId || job.episodeId !== episodeId) {
       return;
     }
 
@@ -764,12 +814,7 @@ export class StreamEncodeService {
     const folderName = streamFolderName(slug, tz, profile);
     const dir = join(streamRoot, folderName);
     this.logger.log(`[${key}] end of air — stop + clear HLS (both slots)`);
-    this.clearAheadHold(key);
-    this.clearSlotEndCatchUp(key);
-    this.clearPromoteDefer(key);
-    const watch = this.standbyWatchTimers.get(key);
-    if (watch) clearTimeout(watch);
-    this.standbyWatchTimers.delete(key);
+    this.cancelChannelTimers(key);
     // Tell clients to stop HLS before wipe — otherwise 503/404 storm + /start spam.
     this.realtime.emitStatus(slug, {
       status: 'off',
@@ -927,16 +972,16 @@ export class StreamEncodeService {
     const key = `${slug}:${tz}:${profile}`;
     const streamRoot = this.config.getOrThrow<string>('STREAM_ROOT').trim();
     const dir = join(streamRoot, streamFolderName(slug, tz, profile));
+    const airWindowStart = this.config.get<string>(
+      'AIR_WINDOW_START',
+      AIR_WINDOW_START,
+    );
+    const hours = this.airTimeHours();
+    const date = calendarDateInTz(tz);
+    const airStart = windowStartAt(date, airWindowStart, tz);
+    const inWindow = isWithinAirWindow(airStart, hours);
 
     try {
-      const airWindowStart = this.config.get<string>(
-        'AIR_WINDOW_START',
-        AIR_WINDOW_START,
-      );
-      const hours = this.airTimeHours();
-      const date = calendarDateInTz(tz);
-      const airStart = windowStartAt(date, airWindowStart, tz);
-      const inWindow = isWithinAirWindow(airStart, hours);
       const finish = await readAirFinish(dir);
 
       if (opts?.resumeCursor && finish) {
@@ -1177,6 +1222,17 @@ export class StreamEncodeService {
         this.logger.log(`[${slug}] continue → grid hold (waiting for schedule)`);
         return 'hold';
       }
+      // Transient DB/ffmpeg errors ≠ end of day — do not wipe HLS / tell clients OFF.
+      if (inWindow && !/off air|не в эфире/i.test(msg)) {
+        this.logger.warn(
+          `[${slug}] continue failed (transient): ${msg} — hold, do not shutdown`,
+        );
+        this.realtime.emitHint(slug, 'hard', {
+          status: 'seam',
+          message: 'Переподключаем эфир…',
+        });
+        return 'hold';
+      }
       this.logger.warn(
         `[${slug}] continue ended (${msg}) — clear HLS`,
       );
@@ -1346,17 +1402,16 @@ export class StreamEncodeService {
       onStandbyPrep: () => {
         if (this.ffmpeg.getActiveSlot(channelKey) !== slot) return;
         if (this.ffmpeg.getStandbySlot(channelKey)) return;
-        void this.spawnStandby(slug, tz, profile, {
+        return this.spawnStandby(slug, tz, profile, {
           completedEpisodeIds: [finish.episodeId],
         });
       },
       onNaturalEnd: ({ rolling }) => {
         if (rolling) {
-          void this.continueEncode(slug, tz, profile, {
+          return this.continueEncode(slug, tz, profile, {
             resumeCursor: true,
             rolling: true,
           });
-          return;
         }
         const standby = this.ffmpeg.getStandbySlot(channelKey);
         const standbyJob = standby
@@ -1367,10 +1422,9 @@ export class StreamEncodeService {
           this.ffmpeg.isJobAlive(standbyJob) &&
           standbyJob.ready
         ) {
-          void this.promoteStandby(slug, tz, profile);
-          return;
+          return this.promoteStandby(slug, tz, profile);
         }
-        void this.continueEncode(slug, tz, profile, {
+        return this.continueEncode(slug, tz, profile, {
           completedEpisodeIds: [finish.episodeId],
         });
       },

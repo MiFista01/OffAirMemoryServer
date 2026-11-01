@@ -7,13 +7,20 @@ import { ParamsSlugDto, QueryBooleanDto, QueryStrDto, QueryStreamProfileDto } fr
 import { StreamProfile } from '@app-types';
 import { Request } from 'express';
 import { SkipThrottle } from '@nestjs/throttler';
+import { ConfigService } from '@nestjs/config';
 
 @Controller('stream')
 export class StreamController {
   constructor(
     private readonly streamService: StreamService,
     private readonly ffmpeg: FfmpegService,
+    private readonly config: ConfigService,
   ) {}
+
+  /** Station air TZ — ignore browser tz (remote viewers must share one encode key). */
+  private airTz(_client?: string): string {
+    return this.config.get<string>('AIR_TZ', 'Europe/Tallinn');
+  }
 
   @Public()
   @SkipThrottle()
@@ -35,7 +42,11 @@ export class StreamController {
     @QueryDto(QueryStrDto, 'tz') tz?: string,
     @QueryDto(QueryStreamProfileDto, 'profile') profile?: StreamProfile,
   ) {
-    const result = await this.streamService.start(slug, tz, profile);
+    const result = await this.streamService.start(
+      slug,
+      this.airTz(tz),
+      profile,
+    );
     return {
       ...result,
       // Absolute URL — Angular just plays it (Nest or nginx behind same host)
@@ -58,7 +69,7 @@ export class StreamController {
   ) {
     const result = await this.streamService.status(
       slug,
-      tz,
+      this.airTz(tz),
       profile,
       !!ensure,
     );
@@ -79,7 +90,7 @@ export class StreamController {
     @QueryDto(QueryStrDto, 'tz') tz?: string,
     @QueryDto(QueryStreamProfileDto, 'profile') profile?: StreamProfile,
   ) {
-    return this.streamService.heartbeat(slug, tz, profile);
+    return this.streamService.heartbeat(slug, this.airTz(tz), profile);
   }
 
   @Public()
@@ -90,7 +101,7 @@ export class StreamController {
     @QueryDto(QueryStrDto, 'tz') tz?: string,
     @QueryDto(QueryStreamProfileDto, 'profile') profile?: StreamProfile,
   ) {
-    return this.streamService.stop(slug, tz, profile);
+    return this.streamService.stop(slug, this.airTz(tz), profile);
   }
 
   private absoluteStreamUrl(

@@ -519,7 +519,8 @@ export class StreamRunEncodeService {
         if (this.ffmpeg.getStandbySlot(channelKey)) return;
         const epId = firstEp?.id;
         if (!epId) return;
-        void host.spawnStandby?.(slug, tz, profile, {
+        // Return the promise so startHls .catch can log — do not void-drop.
+        return host.spawnStandby?.(slug, tz, profile, {
           completedEpisodeIds: [epId],
         });
       },
@@ -535,11 +536,10 @@ export class StreamRunEncodeService {
         }
         if (role === 'retired') return;
         if (rolling) {
-          void host.continueEncode(slug, tz, profile, {
+          return host.continueEncode(slug, tz, profile, {
             resumeCursor: true,
             rolling: true,
           });
-          return;
         }
         const standby = this.ffmpeg.getStandbySlot(channelKey);
         const standbyJob = standby
@@ -550,10 +550,9 @@ export class StreamRunEncodeService {
           this.ffmpeg.isJobAlive(standbyJob) &&
           standbyJob.ready
         ) {
-          void host.promoteStandby?.(slug, tz, profile);
-          return;
+          return host.promoteStandby?.(slug, tz, profile);
         }
-        void host.continueEncode(slug, tz, profile, {
+        return host.continueEncode(slug, tz, profile, {
           completedEpisodeIds: firstEp?.id ? [firstEp.id] : encodedEpisodeIds,
         });
       },
