@@ -175,8 +175,14 @@ export class ScheduleDayService
 
     let created = 0;
     for (const channel of channels) {
-      const made = await this.createChannelDay(channel.id, date, airTimeSec);
-      if (made) created += 1;
+      try {
+        const made = await this.createChannelDay(channel.id, date, airTimeSec);
+        if (made) created += 1;
+      } catch (e) {
+        this.logger.warn(
+          `createChannelDay channel=${channel.id} failed: ${e instanceof Error ? e.message : e}`,
+        );
+      }
     }
     this.logger.log(
       `createDaySchedule(${date}): activeChannels=${channels.length} daysCreated=${created}`,
@@ -221,7 +227,14 @@ export class ScheduleDayService
    * Safe to call repeatedly — skips channels that already have a day.
    */
   async onModuleInit() {
-    await this.createDaySchedule();
+    try {
+      await this.createDaySchedule();
+    } catch (e) {
+      // Never crash Nest boot — TV can still serve yesterday until cron/manual rebuild.
+      this.logger.error(
+        `onModuleInit createDaySchedule failed: ${e instanceof Error ? e.message : e}`,
+      );
+    }
   }
 
   private async createChannelDay(
@@ -229,7 +242,23 @@ export class ScheduleDayService
     date: string,
     airTimeSec: number,
   ): Promise<boolean> {
-    if (await this.findOne({ date, channelId })) return false;
+    const existing = await this.findOne({ date, channelId }, [
+      'scheduleItems',
+    ]);
+    if (existing) {
+      // Orphan day (create succeeded, items failed) — rebuild instead of skip.
+      if (!existing.scheduleItems?.length) {
+        this.logger.warn(
+          `createChannelDay channel=${channelId} date=${date}: empty day — rebuild`,
+        );
+        await this.scheduleItemService.remove({
+          scheduleDayId: existing.id,
+        });
+        await this.remove(existing.id);
+      } else {
+        return false;
+      }
+    }
 
     const cartoons = await this.cartoonService.findAllBySearch(
       { channelId, isActive: true },
@@ -254,30 +283,38 @@ export class ScheduleDayService
     const latest = await this.airHistory.latestByCartoon(channelId);
     this.airHistory.applyHistoryToCursors(cartoons, latest);
 
-    const scheduleDay = await this.create({ date, channelId });
-    const { items, cursorTouched } = buildDayPlaylist(
-      scheduleDay.id,
-      channelId,
-      date,
-      cartoons,
-      airTimeSec,
-    );
-
-    if (!items.length) {
-      this.logger.warn(
-        `createChannelDay channel=${channelId} date=${date}: empty playlist (need active cartoons with durationSec)`,
+    // Day + items + cursor bumps in one TX — partial failure must not leave a
+    // filled day with half-advanced cursors (re-run would skip forever).
+    return this.getRepo().manager.transaction(async (manager) => {
+      const scheduleDay = await this.create({ date, channelId }, manager);
+      const { items, cursorTouched } = buildDayPlaylist(
+        scheduleDay.id,
+        channelId,
+        date,
+        cartoons,
+        airTimeSec,
       );
-      await this.remove(scheduleDay.id);
-      return false;
-    }
 
-    await this.scheduleItemService.createBulk({ entities: items });
-    for (const cartoon of cursorTouched.values()) {
-      await this.cartoonService.update(cartoon.id, {
-        cursorSeason: cartoon.cursorSeason,
-        cursorEpisode: cartoon.cursorEpisode,
-      });
-    }
-    return true;
+      if (!items.length) {
+        this.logger.warn(
+          `createChannelDay channel=${channelId} date=${date}: empty playlist (need active cartoons with durationSec)`,
+        );
+        await this.remove(scheduleDay.id, manager);
+        return false;
+      }
+
+      await this.scheduleItemService.createBulk({ entities: items }, manager);
+      for (const cartoon of cursorTouched.values()) {
+        await this.cartoonService.update(
+          cartoon.id,
+          {
+            cursorSeason: cartoon.cursorSeason,
+            cursorEpisode: cartoon.cursorEpisode,
+          },
+          manager,
+        );
+      }
+      return true;
+    });
   }
 }

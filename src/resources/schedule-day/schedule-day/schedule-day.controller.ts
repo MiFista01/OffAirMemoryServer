@@ -2,9 +2,10 @@ import { Controller, Get, Post, Query } from '@nestjs/common';
 import { ScheduleDayService } from './schedule-day.service';
 import { ParamDto, Public } from '@decorators';
 import { ParamsNumbDto, ParamsSlugDto } from '@dtos';
-import { todayUtcDate } from './schedule-day.builder';
 import { ChannelsService } from 'src/resources/channels/channels/channels.service';
 import { BusinessValidationService } from '@utils';
+import { ConfigService } from '@nestjs/config';
+import { calendarDateInTz } from 'src/resources/stream/stream-air.util';
 
 @Controller('schedule-day')
 export class ScheduleDayController {
@@ -12,7 +13,12 @@ export class ScheduleDayController {
     private readonly scheduleDayService: ScheduleDayService,
     private readonly channels: ChannelsService,
     private readonly businessValidation: BusinessValidationService,
+    private readonly config: ConfigService,
   ) {}
+
+  private airDate(): string {
+    return calendarDateInTz(this.airDateTz());
+  }
 
   /** Build today's playlists for all active channels (idempotent). */
   @Public()
@@ -31,10 +37,13 @@ export class ScheduleDayController {
   /** TV guide / EPG: all channels + timed slots for the air day. */
   @Public()
   @Get('guide/today')
-  guideToday(@Query('tz') tz?: string) {
-    return this.scheduleDayService.getTodayGuide(
-      tz?.trim() || 'Europe/Tallinn',
-    );
+  guideToday(@Query('tz') _tz?: string) {
+    // Always station AIR_TZ — browser TZ would shift the "now" line vs encode.
+    return this.scheduleDayService.getTodayGuide(this.airDateTz());
+  }
+
+  private airDateTz(): string {
+    return this.config.get<string>('AIR_TZ', 'Europe/Tallinn');
   }
 
   @Public()
@@ -43,7 +52,7 @@ export class ScheduleDayController {
     @ParamDto(ParamsNumbDto, 'channelId') channelId: number,
   ) {
     return this.scheduleDayService.findAllBySearch(
-      { date: todayUtcDate(), channelId },
+      { date: this.airDate(), channelId },
       [
         'scheduleItems',
         'scheduleItems.episode',
@@ -58,7 +67,7 @@ export class ScheduleDayController {
     const channel = await this.channels.findOne({ slug, isActive: true });
     this.businessValidation.assertExists(channel, 'Channel not found');
     return this.scheduleDayService.findAllBySearch(
-      { date: todayUtcDate(), channelId: channel.id },
+      { date: this.airDate(), channelId: channel.id },
       [
         'scheduleItems',
         'scheduleItems.episode',
