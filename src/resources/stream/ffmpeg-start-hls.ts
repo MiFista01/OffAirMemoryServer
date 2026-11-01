@@ -274,11 +274,11 @@ export async function startHlsUnlocked(
       // do NOT kill this encode (client keeps playing until switch).
       // Short episodes (< bridge+45): still prep standby with a shorter lead.
       if (opts.onStandbyPrep && windowSec >= 40) {
-        // Warm next episode ~30–40s before EOF so intro .ts exist at promote.
-        // Longer lead + -re burns past intro if promote is deferred — keep ≤40s.
+        // Short lead: HLS window is only list_size×time (~24s). A 30–40s -re
+        // warm burns past intro → promote starts ~20s into the next show.
         const prepLead = Math.min(
-          40,
-          Math.max(30, Math.floor(windowSec * 0.1)),
+          14,
+          Math.max(10, Math.floor(windowSec * 0.05)),
         );
         const delayMs = Math.max(8_000, (windowSec - prepLead) * 1000);
         const timer = setTimeout(() => {

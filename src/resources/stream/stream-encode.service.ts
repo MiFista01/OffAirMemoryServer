@@ -207,9 +207,19 @@ export class StreamEncodeService {
     priorEpisodeId: number | undefined,
     job: FfmpegJob,
   ): Promise<FfmpegJob | undefined> {
-    // Must be ≥ standby prepLead (~30–40s) or every seam cold-restarts B.
-    const maxBurn = Number(
-      this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 45),
+    // Cap by HLS sliding window (list_size×time ≈ 24s): burn past that and
+    // intro .ts are already deleted — client would start mid-episode.
+    const hlsTime = Number(this.config.get('HLS_TIME', 2));
+    const listSize = Number(this.config.get('HLS_LIST_SIZE', 12));
+    const windowSec =
+      (Number.isFinite(hlsTime) ? hlsTime : 2) *
+      (Number.isFinite(listSize) ? listSize : 12);
+    const configured = Number(
+      this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 8),
+    );
+    const maxBurn = Math.min(
+      Number.isFinite(configured) && configured > 0 ? configured : 8,
+      Math.max(6, Math.floor(windowSec * 0.4)),
     );
     const burn =
       (job.offsetSec ?? 0) +
@@ -341,10 +351,11 @@ export class StreamEncodeService {
             400,
         );
         const maxBurnSec = Number(
-          this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 45),
+          this.config.get('STREAM_STANDBY_MAX_BURN_SEC', 8),
         );
-        // Keep living standby if hold fits under burn budget (+slack).
-        const keepWarmMs = Math.max(20_000, (maxBurnSec + 8) * 1000);
+        // Keep living standby only for short holds — long holds freeze+respawn
+        // so promote still gets a fresh intro (not 20s into the show).
+        const keepWarmMs = Math.max(12_000, (maxBurnSec + 6) * 1000);
         const doneEp =
           retiring?.episodeId ?? finish?.episodeId ?? undefined;
 
@@ -369,8 +380,8 @@ export class StreamEncodeService {
           }
           this.ffmpeg.setStandbySlot(key, undefined);
           const prepLeadMs = Math.min(
-            28_000,
-            Math.max(15_000, waitMs - 2_000),
+            14_000,
+            Math.max(10_000, waitMs - 2_000),
           );
           const spawnDelayMs = Math.max(0, waitMs - prepLeadMs);
           if (doneEp) {
