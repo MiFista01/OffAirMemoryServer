@@ -423,6 +423,22 @@ export class StreamEncodeService {
       this.logger.warn(`[${key}] promoteStandby — standby not ready after intro check`);
       return 'failed';
     }
+    // m3u8 may list .ts ffmpeg already deleted — client then 404-storms on switch.
+    // Require a contiguous playlist before emit switch (one short retry).
+    if (job.dir && !(await this.ffmpeg.isPlaylistAppendable(job.dir))) {
+      await new Promise((r) => setTimeout(r, 1_200));
+      if (!(await this.ffmpeg.isPlaylistAppendable(job.dir))) {
+        this.logger.warn(
+          `[${key}] promoteStandby — playlist has missing .ts — defer`,
+        );
+        const t = setTimeout(() => {
+          this.standbyWatchTimers.delete(key);
+          void this.promoteStandby(slug, tz, profile);
+        }, 3_000);
+        this.standbyWatchTimers.set(key, t);
+        return 'failed';
+      }
+    }
 
     this.ffmpeg.setActiveSlot(key, standby);
     this.ffmpeg.setStandbySlot(key, undefined);
