@@ -23,6 +23,17 @@ import { startEnvCheck } from '@constants';
 import session from 'express-session';
 import { FfmpegService } from './resources/stream/ffmpeg.service';
 
+process.on('unhandledRejection', (reason) => {
+  // Encode/HLS fire-and-forget must not kill Nest (Node may exit on unhandled).
+  console.error(
+    '[unhandledRejection]',
+    reason instanceof Error ? reason.stack ?? reason.message : reason,
+  );
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err.stack ?? err.message);
+});
+
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     rawBody: true,
