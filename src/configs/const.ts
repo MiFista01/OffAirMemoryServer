@@ -17,7 +17,15 @@ export const cookiesDays = 2;
 
 export const fileCleanerKey = 'fileCleaner';
 
-export const keyWithoutLike = ['createdAt', 'updatedAt', 'slug'];
+export const keyWithoutLike = [
+  'createdAt',
+  'updatedAt',
+  'slug',
+  'date',
+  'email',
+  'username',
+  'uuid',
+];
 
 export const tokenCookieName = 'authToken';
 
