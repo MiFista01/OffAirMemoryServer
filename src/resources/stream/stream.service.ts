@@ -151,7 +151,20 @@ export class StreamService implements OnModuleDestroy {
 
     // 1) Live encode — reconnect, BUT do not serve one stuck on the ending.
     const existing = this.ffmpeg.get(key);
-    if (existing && this.ffmpeg.isJobAlive(existing)) {
+    let reuseExisting = !!(existing && this.ffmpeg.isJobAlive(existing));
+    // Nest can keep a "ready" job while nginx 503s — playlist wiped / volume glitch.
+    if (reuseExisting && existing) {
+      try {
+        await access(join(existing.dir, 'playlist.m3u8'));
+      } catch {
+        this.logger.warn(
+          `[${key}] /start — ffmpeg alive but playlist.m3u8 missing — restart`,
+        );
+        this.ffmpeg.stopChannel(key);
+        reuseExisting = false;
+      }
+    }
+    if (reuseExisting && existing && this.ffmpeg.isJobAlive(existing)) {
       const stallSec = Number(this.config.get('STREAM_STALL_SEC', 15));
       const ageMs = await this.ffmpeg.segmentAgeMs(existing.dir);
       const stalled =
@@ -1181,9 +1194,11 @@ export class StreamService implements OnModuleDestroy {
     const alive = !!(job && this.ffmpeg.isJobAlive(job));
     // Keep idle TTL alive while the client polls /status during cold seek.
     if (alive) this.ffmpeg.touch(key);
-    // Never report live from orphan playlist alone — wiped encode leaves fresh .ts briefly.
+    // Never report live without an on-disk playlist — job.ready alone caused
+    // API "live" while nginx mapped missing m3u8 → 503 "HLS preparing".
     let ready =
-      !!job?.ready || (alive && ageMs != null && ageMs < 30_000);
+      hasPlaylist &&
+      (!!job?.ready || (alive && ageMs != null && ageMs < 30_000));
 
     if (job && ready && !job.ready) job.ready = true;
 
@@ -1200,6 +1215,28 @@ export class StreamService implements OnModuleDestroy {
         pollAfterMs: undefined as number | undefined,
         message: undefined as string | undefined,
       };
+    }
+
+    // Alive encode but no m3u8 yet/anymore — client must poll, not attach.
+    if (alive && !hasPlaylist && ensure) {
+      // Kick a real restart via /start path (same process).
+      try {
+        const started = await this.start(slug, tz, profile);
+        return {
+          channel: slug,
+          key,
+          alive: started.status !== 'off',
+          ready: !!started.ready,
+          playable: !!started.playable,
+          status: started.status,
+          streamUrl: started.ready ? started.streamUrl : null,
+          ageSec: null as number | null,
+          pollAfterMs: started.ready ? undefined : 2000,
+          message: started.message,
+        };
+      } catch (e) {
+        this.logger.warn(`[${key}] status ensure after missing playlist: ${e}`);
+      }
     }
 
     if (alive) {
