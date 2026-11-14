@@ -4,7 +4,6 @@ import {
   Column,
   CreateDateColumn,
   Entity,
-  Index,
   JoinColumn,
   OneToOne,
   PrimaryGeneratedColumn,
@@ -15,9 +14,9 @@ import { User } from '@entities';
 import { Exclude } from 'class-transformer';
 
 @Entity()
-@Index(['userId'])
-@Index(['username'])
-@Index(['email'])
+// Do not @Index username/email — Column unique:true already makes UNIQUE INDEX
+// with the same name → MariaDB ER_DUP_KEYNAME on synchronize.
+// userId uniqueness comes from OneToOne @JoinColumn.
 export class UserAuth {
   @PrimaryGeneratedColumn()
   id: number;
