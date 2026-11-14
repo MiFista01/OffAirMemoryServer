@@ -45,7 +45,6 @@
     "cookie-parser": "^1.4.7",
     "dotenv": "^17.2.3",
     "express-session": "^1.19.0",
-    "fs": "0.0.1-security",
     "fs-extra": "^11.3.2",
     "helmet": "^8.1.0",
     "multer": "^2.0.2",
@@ -98,6 +97,11 @@
     "typedoc": "^0.28.15",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.50.0"
+  },
+  "overrides": {
+    "@nestjs/core": "$@nestjs/core",
+    "@nestjs/common": "$@nestjs/common",
+    "@nestjs/platform-express": "$@nestjs/platform-express"
   },
   "jest": {
     "moduleFileExtensions": [
