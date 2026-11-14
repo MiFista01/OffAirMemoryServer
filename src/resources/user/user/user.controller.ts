@@ -6,6 +6,7 @@ import { ParamsNumbDto, QueryArrayDto, QueryStrDto } from '@dtos';
 import { SearchUserDto } from './dto/search.dto';
 import { ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { userSwaggerBodySearch } from '@swagger';
+import { normalizePublicSearchPageOpt } from '@constants';
 
 @ApiTags('Users')
 @Controller('user')
@@ -36,7 +37,7 @@ export class UserController {
     const result = await this.userService.findAllBySearch(
       search,
       relationsWithProfile,
-      { page: page || -1, limit: limit || -1 },
+      normalizePublicSearchPageOpt(page, limit),
     );
     return result;
   }
