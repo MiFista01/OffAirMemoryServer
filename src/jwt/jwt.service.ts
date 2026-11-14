@@ -6,7 +6,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { LessThan, Repository } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
 import { every3Days } from '@cron';
-import { cookiesDays, dayMs } from '@constants';
+import { dayMs, getCookiesDays } from '@constants';
 import { Logger } from 'winston';
 import { WINSTON_MODULE_PROVIDER } from 'nest-winston';
 
@@ -55,7 +55,7 @@ export class TooledJwtService {
   @Cron(every3Days)
   async clearFromBlacklist() {
     const currentDate = new Date();
-    const clearDate = new Date(currentDate.getTime() - dayMs * cookiesDays);
+    const clearDate = new Date(currentDate.getTime() - dayMs * getCookiesDays());
     const result = await this.tokenBlacklistRep.delete({
       createdAt: LessThan(clearDate),
     });

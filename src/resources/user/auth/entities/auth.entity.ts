@@ -28,12 +28,14 @@ export class UserAuth {
   @Exclude()
   @Column({
     update: false,
+    unique: true,
   })
   username: string;
 
   @Exclude()
   @Column({
     update: false,
+    unique: true,
   })
   email: string;
 

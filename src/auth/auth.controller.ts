@@ -10,7 +10,12 @@ import {
 import { AuthService } from './auth.service';
 import { AuthDto } from './dto/auth.dto';
 import { Request, Response } from 'express';
-import { cookiesDays, dayMs, tokenCookieName } from '@constants';
+import {
+  dayMs,
+  getCookiesDays,
+  isDeployEnv,
+  tokenCookieName,
+} from '@constants';
 import { Public } from '@decorators';
 import { TooledJwtService } from 'src/jwt/jwt.service';
 import { ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
@@ -45,8 +50,8 @@ export class AuthController {
     res.cookie(tokenCookieName, token, {
       httpOnly: true,
       sameSite: 'strict',
-      secure: process.env.PROJECT_STATUS === 'deploy',
-      maxAge: dayMs * cookiesDays,
+      secure: isDeployEnv(),
+      maxAge: dayMs * getCookiesDays(),
       path: '/',
     });
 
@@ -77,8 +82,8 @@ export class AuthController {
     res.cookie(tokenCookieName, token, {
       httpOnly: true,
       sameSite: 'strict',
-      secure: process.env.PROJECT_STATUS === 'deploy',
-      maxAge: dayMs * cookiesDays,
+      secure: isDeployEnv(),
+      maxAge: dayMs * getCookiesDays(),
       path: '/',
     });
     res.status(202).json({
