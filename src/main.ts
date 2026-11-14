@@ -19,7 +19,11 @@ import compression from 'compression';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { BusinessValidationService } from '@utils';
-import { startEnvCheck } from '@constants';
+import {
+  corsOriginsFromEnv,
+  isDeployEnv,
+  startEnvCheck,
+} from '@constants';
 import session from 'express-session';
 import { FfmpegService } from './resources/stream/ffmpeg.service';
 
@@ -34,6 +38,15 @@ process.on('uncaughtException', (err) => {
   console.error('[uncaughtException]', err.stack ?? err.message);
 });
 
+const SENSITIVE_FIELD_RE = /password|passwd|secret|token|authorization|cookie/i;
+
+function sanitizeValidationValue(property: string, value: unknown): unknown {
+  if (SENSITIVE_FIELD_RE.test(property)) {
+    return '[redacted]';
+  }
+  return value;
+}
+
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     rawBody: true,
@@ -42,9 +55,18 @@ async function bootstrap() {
   const businessLogic: BusinessValidationService = app.get(
     BusinessValidationService,
   );
+  const configService = app.get(ConfigService);
+  const deploy = isDeployEnv(configService.get<string>('PROJECT_STATUS'));
+
   app.getHttpAdapter().getInstance().set('trust proxy', 1);
   for (const env of startEnvCheck) {
     businessLogic.assertExists(config.get<string>(env), `${env} is required`);
+  }
+  if (deploy) {
+    businessLogic.assertExists(
+      configService.get<string>('SESSION_SECRET'),
+      'SESSION_SECRET is required',
+    );
   }
 
   // HLS files when nginx is off
@@ -112,19 +134,22 @@ async function bootstrap() {
       threshold: 1024,
     }),
   );
-  const swaggerConfig = new DocumentBuilder()
-    .setTitle('Off-Air Memory API')
-    .setDescription(
-      'Backend for Off-Air Memory: channels, cartoons, episodes, media scan, broadcast tags, and daily TV schedule',
-    )
-    .setVersion('1.0')
-    .addTag('off-air-memory')
-    .build();
-  const documentFactory = () =>
-    SwaggerModule.createDocument(app, swaggerConfig);
-  SwaggerModule.setup('docs', app, documentFactory);
 
-  const configService = app.get(ConfigService);
+  // Swagger only outside deploy/production
+  if (!deploy) {
+    const swaggerConfig = new DocumentBuilder()
+      .setTitle('Off-Air Memory API')
+      .setDescription(
+        'Backend for Off-Air Memory: channels, cartoons, episodes, media scan, broadcast tags, and daily TV schedule',
+      )
+      .setVersion('1.0')
+      .addTag('off-air-memory')
+      .build();
+    const documentFactory = () =>
+      SwaggerModule.createDocument(app, swaggerConfig);
+    SwaggerModule.setup('docs', app, documentFactory);
+  }
+
   app.setGlobalPrefix(configService.get<string>('API_NAME', 'api'));
 
   app.useGlobalInterceptors(new ClassSerializerInterceptor(app.get(Reflector)));
@@ -157,8 +182,13 @@ async function bootstrap() {
     }
     next();
   });
+
+  // deploy: FRONT_URL (+ comma-separated). develop: reflect Origin (local DX).
+  const corsOrigins = corsOriginsFromEnv(
+    configService.get<string>('FRONT_URL'),
+  );
   app.enableCors({
-    origin: true,
+    origin: deploy ? corsOrigins : true,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
     maxAge: 86400,
@@ -172,17 +202,10 @@ async function bootstrap() {
       transform: true,
       errorHttpStatusCode: HttpStatus.UNPROCESSABLE_ENTITY, // 422
       exceptionFactory: (errors) => {
-        console.log('=== VALIDATION ERRORS ===');
-
-        const hasConstraintsInChildren = (err: any): boolean => {
-          if (err.constraints) return true;
-          if (err.children) {
-            return err.children.some((child: any) =>
-              hasConstraintsInChildren(child),
-            );
-          }
-          return false;
-        };
+        const logDetails = !deploy;
+        if (logDetails) {
+          console.log('=== VALIDATION ERRORS ===');
+        }
 
         let childCounter = 0;
 
@@ -192,6 +215,9 @@ async function bootstrap() {
           isRoot: boolean = true,
           parentWasLogged: boolean = false,
         ): void => {
+          if (!logDetails) {
+            return;
+          }
           errs.forEach((error, index) => {
             const currentPath = path
               ? `${path}.${error.property}`
@@ -208,7 +234,10 @@ async function bootstrap() {
 
               console.log(`\n[${label}]`);
               console.log('Property:', currentPath);
-              console.log('Value:', error.value);
+              console.log(
+                'Value:',
+                sanitizeValidationValue(currentPath, error.value),
+              );
               console.log('Value type:', typeof error.value);
               console.log(
                 'Constraints:',
@@ -227,7 +256,9 @@ async function bootstrap() {
         };
 
         logErrors(errors);
-        console.log('=== END VALIDATION ERRORS ===');
+        if (logDetails) {
+          console.log('=== END VALIDATION ERRORS ===');
+        }
 
         const collectErrors = (errs: any[], path: string = ''): any[] => {
           const result: any[] = [];
@@ -240,12 +271,19 @@ async function bootstrap() {
             if (error.children && error.children.length > 0) {
               result.push(...collectErrors(error.children, currentPath));
             } else if (error.constraints) {
-              result.push({
+              const entry: Record<string, unknown> = {
                 property: currentPath,
-                value: error.value,
                 constraints: error.constraints,
                 messages: Object.values(error.constraints),
-              });
+              };
+              // Never send raw values in deploy; in develop redact secrets only.
+              if (!deploy) {
+                entry.value = sanitizeValidationValue(
+                  currentPath,
+                  error.value,
+                );
+              }
+              result.push(entry);
             }
           }
 
@@ -255,7 +293,7 @@ async function bootstrap() {
         const allErrors = collectErrors(errors);
 
         const errorMessages = allErrors
-          .map((err) => err.messages.join(', '))
+          .map((err) => (err.messages as string[]).join(', '))
           .join('; ');
 
         return new BadRequestException({
@@ -270,7 +308,9 @@ async function bootstrap() {
 
   app.use(
     session({
-      secret: configService.get<string>('SESSION_SECRET') ?? 'marsel',
+      secret:
+        configService.get<string>('SESSION_SECRET') ||
+        (deploy ? '' : 'marsel-dev-only'),
       resave: false,
       saveUninitialized: false,
     }),

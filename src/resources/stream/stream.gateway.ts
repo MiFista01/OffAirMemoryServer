@@ -10,10 +10,15 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Public } from '@decorators';
+import { corsOriginsFromEnv, isDeployEnv } from '@constants';
 import { Server, Socket } from 'socket.io';
 import { StreamRealtimeService } from './stream-realtime.service';
 import { StreamService } from './stream.service';
 import { ConfigService } from '@nestjs/config';
+
+const streamGatewayCorsOrigin = isDeployEnv()
+  ? corsOriginsFromEnv()
+  : true;
 
 type JoinBody = {
   slug?: string;
@@ -31,7 +36,7 @@ type PlayIssueBody = {
 @Public()
 @WebSocketGateway({
   namespace: '/stream',
-  cors: { origin: true, credentials: true },
+  cors: { origin: streamGatewayCorsOrigin, credentials: true },
 })
 export class StreamGateway implements OnGatewayInit {
   private readonly logger = new Logger(StreamGateway.name);
