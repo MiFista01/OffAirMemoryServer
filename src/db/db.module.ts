@@ -5,6 +5,7 @@ import * as dotenv from 'dotenv';
 import { BackupService } from './backup/backup.service';
 import * as entities from '@entities';
 import * as entitiesLite from '@entities-lite';
+import { isDeployEnv } from '@constants';
 
 dotenv.config();
 
@@ -18,6 +19,7 @@ function getDbConf(isNamed: boolean = false) {
         configService.get<string>('DB_NAME') ||
         process.env.DB_NAME ||
         'off_air_memory';
+      const deploy = isDeployEnv(configService.get<string>('PROJECT_STATUS'));
       return {
         type: 'mariadb' as const,
         host: configService.get<string>('DB_HOST'),
@@ -26,9 +28,9 @@ function getDbConf(isNamed: boolean = false) {
         password: configService.get<string>('DB_PASS') ?? '',
         database,
         entities: [...Object.values(entities)],
-        // Creates/updates tables on boot. Does NOT create the database itself —
-        // run CREATE DATABASE off_air_memory; on MariaDB first.
-        synchronize: true,
+        // Soft: sync in develop; never auto-mutate schema in deploy/production.
+        // Does NOT create the database itself — run CREATE DATABASE first.
+        synchronize: !deploy,
         timezone: 'Z',
         extra: {
           connectionLimit: 10,

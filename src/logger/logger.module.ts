@@ -1,6 +1,6 @@
 import { Global, Module } from '@nestjs/common';
 import { WinstonModule } from 'nest-winston';
-import { winstonLoggerTuner } from '@constants';
+import { isDeployEnv, winstonLoggerTuner } from '@constants';
 import * as winston from 'winston';
 const onlyTag = (tag: string) =>
   winston.format((info) => (info.tag === tag ? info : false))();
@@ -27,7 +27,7 @@ const onlyUntaggedOrApp = winston.format((info) => {
   imports: [
     WinstonModule.forRoot({
       transports: [
-        ...(process.env.PROJECT_STATUS !== 'deploy'
+        ...(!isDeployEnv()
           ? [
               new winston.transports.Console({
                 format: winston.format.combine(
